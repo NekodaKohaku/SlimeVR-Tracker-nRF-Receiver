@@ -1,6 +1,7 @@
 /*
- * SlimeVR Sniffer - Auto Channel Scanner
- * 掃描 0-100 頻道，尋找 E7/C2 地址的訊號
+ * SlimeVR Sniffer - Target Lock Mode
+ * 鎖定單一頻道 (75) 與特定速率 (1Mbps/2Mbps)
+ * 專門用於捕捉開機瞬間的握手包
  */
 
 #include <zephyr/kernel.h>
@@ -9,33 +10,30 @@
 #include <zephyr/drivers/uart.h>
 #include <esb.h>
 
-// --- 配置區 ---
-// 如果掃不到，下一輪嘗試把這裡改成 ESB_BITRATE_1MBPS
-#define SNIFFER_BITRATE ESB_BITRATE_2MBPS 
+// --- 關鍵配置區 (修改這裡來測試) ---
 
+// 1. 鎖定頻率 (根據您的逆向工程結果是 75)
+#define TARGET_CHANNEL 75
+
+// 2. 傳輸速率 (請先試 1Mbps，如果不對再把註解換過來試 2Mbps)
+#define SNIFFER_BITRATE ESB_BITRATE_1MBPS
+// #define SNIFFER_BITRATE ESB_BITRATE_2MBPS
+
+// --- 地址配置 (已確認正確) ---
 static const uint8_t base_addr_0[4] = {0xE7, 0xE7, 0xE7, 0xE7};
 static const uint8_t prefix_0 = 0xE7;
 static const uint8_t base_addr_1[4] = {0xC2, 0xC2, 0xC2, 0xC2};
 static const uint8_t prefix_1 = 0xC2;
 
 static struct esb_payload rx_payload;
-static bool found_signal = false;
-static int current_channel = 0;
 
 void event_handler(struct esb_evt const *event)
 {
     switch (event->evt_id) {
     case ESB_EVENT_RX_RECEIVED:
-        // 收到數據了！
         if (esb_read_rx_payload(&rx_payload) == 0) {
-            // 標記已找到，主迴圈將停止跳頻
-            if (!found_signal) {
-                printk("\n!!! SIGNAL FOUND ON CHANNEL %d !!!\n", current_channel);
-                found_signal = true;
-            }
-            
-            // 印出數據
-            printk("CH:%d LEN:%d DATA:", current_channel, rx_payload.length);
+            // 收到數據！印出詳細 Hex
+            printk("!!! CAPTURED on CH:%d !!! LEN:%d DATA:", TARGET_CHANNEL, rx_payload.length);
             for (int i = 0; i < rx_payload.length; i++) {
                 printk(" %02X", rx_payload.data[i]);
             }
@@ -49,11 +47,10 @@ int esb_initialize(void)
 {
     int err;
     struct esb_config config = ESB_DEFAULT_CONFIG;
-    
-    // 設定參數
+
     config.protocol = ESB_PROTOCOL_ESB_DPL;
     config.bitrate = SNIFFER_BITRATE;
-    config.mode = ESB_MODE_PRX;
+    config.mode = ESB_MODE_PRX; // 接收模式
     config.event_handler = event_handler;
     config.crc = ESB_CRC_16BIT;
 
@@ -62,11 +59,16 @@ int esb_initialize(void)
 
     err = esb_set_base_address_0(base_addr_0);
     if (err) return err;
+
     err = esb_set_base_address_1(base_addr_1);
     if (err) return err;
 
     uint8_t prefixes[8] = {prefix_0, prefix_1, 0, 0, 0, 0, 0, 0};
     err = esb_set_prefixes(prefixes, 8);
+    if (err) return err;
+
+    // 直接鎖定頻率，不需在迴圈設定
+    err = esb_set_rf_channel(TARGET_CHANNEL);
     if (err) return err;
 
     return 0;
@@ -76,45 +78,31 @@ int main(void)
 {
     int err;
 
-    // 1. USB 初始化
+    // 初始化 USB
     if (IS_ENABLED(CONFIG_USB_DEVICE_STACK)) {
         err = usb_enable(NULL);
     }
-    
-    k_sleep(K_SECONDS(2)); // 給您時間打開 Putty
-    printk("=== SlimeVR Auto Scanner Started ===\n");
-    printk("Bitrate: %s\n", (SNIFFER_BITRATE == ESB_BITRATE_2MBPS) ? "2Mbps" : "1Mbps");
 
-    // 2. ESB 初始化
+    // 等待您打開 Putty
+    k_sleep(K_SECONDS(3));
+    
+    printk("\n=== SlimeVR Target Lock Sniffer ===\n");
+    printk("Locked Channel: %d\n", TARGET_CHANNEL);
+    printk("Bitrate: %s\n", (SNIFFER_BITRATE == ESB_BITRATE_2MBPS) ? "2Mbps" : "1Mbps");
+    printk("Addresses: E7... / C2...\n");
+    printk("Waiting for tracker power-on signal...\n");
+
     err = esb_initialize();
     if (err) {
         printk("ESB Init failed: %d\n", err);
         return 0;
     }
 
-    // 3. 開始掃描迴圈
     esb_start_rx();
 
+    // 主迴圈只需活著，讓中斷處理數據
     while (1) {
-        if (found_signal) {
-            // 如果找到訊號，就停在這裡只處理數據，不再跳頻
-            k_sleep(K_MSEC(100)); 
-            continue;
-        }
-
-        // 切換頻道
-        esb_stop_rx();
-        current_channel++;
-        if (current_channel > 100) current_channel = 0; // 掃描範圍 0-100
-
-        err = esb_set_rf_channel(current_channel);
-        esb_start_rx();
-
-        // 在這個頻道停留 100ms 聽聽看
-        // 顯示目前進度 (用 \r 讓它在同一行更新，不洗版)
-        printk("Scanning... %d \r", current_channel);
-        
-        k_sleep(K_MSEC(100));
+        k_sleep(K_FOREVER);
     }
     return 0;
 }
