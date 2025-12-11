@@ -13,7 +13,7 @@
 // --- 關鍵配置區 (修改這裡來測試) ---
 
 // 1. 鎖定頻率 (根據您的逆向工程結果是 75)
-#define TARGET_CHANNEL 75
+#define TARGET_CHANNEL 0
 
 // 2. 傳輸速率 (請先試 1Mbps，如果不對再把註解換過來試 2Mbps)
 #define SNIFFER_BITRATE ESB_BITRATE_1MBPS
