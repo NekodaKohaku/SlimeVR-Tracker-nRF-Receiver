@@ -1,45 +1,40 @@
 /*
- * SlimeVR Sniffer - Target Lock Mode
- * 鎖定單一頻道 (75) 與特定速率 (1Mbps/2Mbps)
- * 專門用於捕捉開機瞬間的握手包
+ * Pico Tracker Specific Sniffer
+ * Based on Reverse Engineering of Firmware v0.6.9
+ * Target Channels: 73 (0x49), 45 (0x2d)
+ * Target Addresses: E7E7E7E7E7, 4343434343
  */
 
 #include <zephyr/kernel.h>
 #include <zephyr/sys/printk.h>
 #include <zephyr/usb/usb_device.h>
-#include <zephyr/drivers/uart.h>
 #include <esb.h>
 
-// --- 關鍵配置區 (修改這裡來測試) ---
+// --- 反向工程發現的關鍵頻率 ---
+// 代碼中 FUN_00005214 顯示它使用 0x49 (73) 或 0x2d (45)
+#define TARGET_CH_A 73
+#define TARGET_CH_B 45
 
-// 1. 鎖定頻率 (根據您的逆向工程結果是 75)
-#define TARGET_CHANNEL 0
-
-// 2. 傳輸速率 (請先試 1Mbps，如果不對再把註解換過來試 2Mbps)
-#define SNIFFER_BITRATE ESB_BITRATE_1MBPS
-// #define SNIFFER_BITRATE ESB_BITRATE_2MBPS
-
-// --- 地址配置 (已確認正確) ---
+// --- 反向工程發現的地址 ---
+// FUN_000053e0 顯示寫入了 0xe7e7e7e7 和 0x43434343
 static const uint8_t base_addr_0[4] = {0xE7, 0xE7, 0xE7, 0xE7};
+static const uint8_t base_addr_1[4] = {0x43, 0x43, 0x43, 0x43}; // ASCII 'C'
 static const uint8_t prefix_0 = 0xE7;
-static const uint8_t base_addr_1[4] = {0xC2, 0xC2, 0xC2, 0xC2};
-static const uint8_t prefix_1 = 0xC2;
+static const uint8_t prefix_1 = 0x43;
 
 static struct esb_payload rx_payload;
 
 void event_handler(struct esb_evt const *event)
 {
-    switch (event->evt_id) {
-    case ESB_EVENT_RX_RECEIVED:
+    if (event->evt_id == ESB_EVENT_RX_RECEIVED) {
         if (esb_read_rx_payload(&rx_payload) == 0) {
-            // 收到數據！印出詳細 Hex
-            printk("!!! CAPTURED on CH:%d !!! LEN:%d DATA:", TARGET_CHANNEL, rx_payload.length);
+            printk("CAPTURED! CH:%d LEN:%d DATA:", 
+                   (NRF_RADIO->FREQUENCY), rx_payload.length);
             for (int i = 0; i < rx_payload.length; i++) {
                 printk(" %02X", rx_payload.data[i]);
             }
             printk("\n");
         }
-        break;
     }
 }
 
@@ -47,62 +42,66 @@ int esb_initialize(void)
 {
     int err;
     struct esb_config config = ESB_DEFAULT_CONFIG;
-
-    config.protocol = ESB_PROTOCOL_ESB_DPL;
-    config.bitrate = SNIFFER_BITRATE;
-    config.mode = ESB_MODE_PRX; // 接收模式
+    
+    // Pico 為了低延遲通常用 2Mbps，但也可能為了兼容性用 1Mbps
+    // 建議先試 2Mbps (FUN_00001ce0 中有對 PCNF1 的操作暗示高速)
+    config.bitrate = ESB_BITRATE_2MBPS;
+    config.mode = ESB_MODE_PRX;
     config.event_handler = event_handler;
     config.crc = ESB_CRC_16BIT;
+    config.selective_auto_ack = true; // 嘗試開啟 ACK，看能否騙它多吐點數據
 
     err = esb_init(&config);
     if (err) return err;
 
     err = esb_set_base_address_0(base_addr_0);
     if (err) return err;
-
     err = esb_set_base_address_1(base_addr_1);
     if (err) return err;
 
+    // 設定 Prefix (E7, 43...)
     uint8_t prefixes[8] = {prefix_0, prefix_1, 0, 0, 0, 0, 0, 0};
     err = esb_set_prefixes(prefixes, 8);
-    if (err) return err;
-
-    // 直接鎖定頻率，不需在迴圈設定
-    err = esb_set_rf_channel(TARGET_CHANNEL);
-    if (err) return err;
-
-    return 0;
+    return err;
 }
 
 int main(void)
 {
-    int err;
-
-    // 初始化 USB
     if (IS_ENABLED(CONFIG_USB_DEVICE_STACK)) {
-        err = usb_enable(NULL);
+        usb_enable(NULL);
     }
-
-    // 等待您打開 Putty
-    k_sleep(K_SECONDS(3));
     
-    printk("\n=== SlimeVR Target Lock Sniffer ===\n");
-    printk("Locked Channel: %d\n", TARGET_CHANNEL);
-    printk("Bitrate: %s\n", (SNIFFER_BITRATE == ESB_BITRATE_2MBPS) ? "2Mbps" : "1Mbps");
-    printk("Addresses: E7... / C2...\n");
-    printk("Waiting for tracker power-on signal...\n");
+    k_sleep(K_SECONDS(2));
+    printk("=== Pico Tracker Specific Sniffer ===\n");
+    printk("Scanning Targets: CH %d & CH %d\n", TARGET_CH_A, TARGET_CH_B);
+    printk("Addresses: E7... & 43... (From Firmware Analysis)\n");
 
-    err = esb_initialize();
-    if (err) {
-        printk("ESB Init failed: %d\n", err);
+    if (esb_initialize() != 0) {
+        printk("ESB Init Failed\n");
         return 0;
     }
 
     esb_start_rx();
 
-    // 主迴圈只需活著，讓中斷處理數據
+    int current_target = TARGET_CH_A;
+
     while (1) {
-        k_sleep(K_FOREVER);
+        // 在兩個關鍵頻道間切換
+        esb_stop_rx();
+        esb_set_rf_channel(current_target);
+        esb_start_rx();
+        
+        // 打印當前監聽狀態 (不換行以保持整潔)
+        printk("Listening on CH %d... \r", current_target);
+        
+        // 每個頻道聽 200ms
+        k_sleep(K_MSEC(200));
+
+        // 切換
+        if (current_target == TARGET_CH_A) 
+            current_target = TARGET_CH_B;
+        else 
+            current_target = TARGET_CH_A;
     }
     return 0;
 }
