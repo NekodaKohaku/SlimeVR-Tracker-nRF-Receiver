@@ -1,8 +1,6 @@
 /*
- * Pico Tracker "Hunter" Sniffer
- * Target: Pairing Mode (Red/Blue Flash)
- * Channels: 73, 45 (From Firmware Analysis)
- * Addresses: E7 (Default), 43 (Pico Special)
+ * Pico Tracker "Active Pinger"
+ * 模擬頭顯發送訊號，誘發 Tracker 回傳 ACK
  */
 
 #include <zephyr/kernel.h>
@@ -10,65 +8,76 @@
 #include <zephyr/usb/usb_device.h>
 #include <esb.h>
 
-// --- 來自固件分析的關鍵參數 ---
-#define CH_A 73  // 0x49
-#define CH_B 45  // 0x2d
+// 定義目標
+#define CH_A 73
+#define CH_B 45
 
-// 地址表
-static const uint8_t base_addr_0[4] = {0xE7, 0xE7, 0xE7, 0xE7}; // Default
-static const uint8_t base_addr_1[4] = {0x43, 0x43, 0x43, 0x43}; // Pico Special 'C'
+// 定義地址
+static const uint8_t addr_pico[5]    = {0x43, 0x43, 0x43, 0x43, 0x43}; // CCCCC
+static const uint8_t addr_default[5] = {0xE7, 0xE7, 0xE7, 0xE7, 0xE7};
 
-// Prefixes (前綴)
-static const uint8_t prefix_0 = 0xE7;
-static const uint8_t prefix_1 = 0x43; // 配合 Base 1 形成 4343434343
-
-static struct esb_payload rx_payload;
-
-void event_handler(struct esb_evt const *event)
-{
-    switch (event->evt_id) {
-    case ESB_EVENT_RX_RECEIVED:
-        if (esb_read_rx_payload(&rx_payload) == 0) {
-            // 抓到了！
-            printk("\n!!! BINGO !!! Captured on CH:%d\n", (NRF_RADIO->FREQUENCY));
-            printk("LEN:%d PIPE:%d DATA:", rx_payload.length, rx_payload.pipe);
-            for (int i = 0; i < rx_payload.length; i++) {
-                printk(" %02X", rx_payload.data[i]);
-            }
-            printk("\n");
-            
-            // 如果抓到數據，LED 閃一下提示 (如果有的話)
-        }
-        break;
-    }
-}
+// 構建一個簡單的 Payload (內容不重要，重要的是能觸發 ACK)
+static uint8_t tx_payload_data[8] = {0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08};
 
 int esb_initialize(void)
 {
     int err;
     struct esb_config config = ESB_DEFAULT_CONFIG;
 
-    // Pico 通常使用 2Mbps
-    config.bitrate = ESB_BITRATE_2MBPS;
-    config.mode = ESB_MODE_PRX;
-    config.event_handler = event_handler;
+    // 必須使用 PTX (發射模式)
+    config.protocol = ESB_PROTOCOL_ESB_DPL;
+    config.bitrate = ESB_BITRATE_2MBPS; // Pico 99% 是 2Mbps
+    config.mode = ESB_MODE_PTX;
+    config.event_handler = NULL; // 我們不需要處理接收事件，只需要知道發送是否成功
     config.crc = ESB_CRC_16BIT;
-    
-    // 開啟 ACK，試圖讓追蹤器以為連上了
-    config.selective_auto_ack = true;
+    config.tx_output_power = 4; // 開到最大功率 +4dBm
+    config.retransmit_delay = 500;
+    config.retransmit_count = 3;
 
     err = esb_init(&config);
     if (err) return err;
+    
+    // 設定地址 (雖然是 PTX，但我們要設定發送的目標地址)
+    // 這裡我們動態切換 Base Address，所以在 Init 隨便設一個即可
+    err = esb_set_base_address_0(addr_pico + 1);
+    err = esb_set_prefixes(addr_pico, 1);
+    
+    return 0;
+}
 
-    err = esb_set_base_address_0(base_addr_0);
-    if (err) return err;
-    err = esb_set_base_address_1(base_addr_1);
-    if (err) return err;
+// 發送函式
+bool try_ping(uint8_t channel, const uint8_t *addr, const char *addr_name)
+{
+    int err;
+    struct esb_payload tx_payload = ESB_CREATE_PAYLOAD(0, tx_payload_data);
+    
+    // 1. 設定頻率
+    esb_stop_rx(); // 停止無線電
+    esb_set_rf_channel(channel);
 
-    // 設定 Pipe 0 和 Pipe 1 的 Prefix
-    uint8_t prefixes[8] = {prefix_0, prefix_1, 0, 0, 0, 0, 0, 0};
-    err = esb_set_prefixes(prefixes, 8);
-    return err;
+    // 2. 設定目標地址 (這是關鍵)
+    // ESB 的地址由 Base(4bytes) + Prefix(1byte) 組成
+    // 我們將 addr[0] 作為 Prefix, addr[1-4] 作為 Base0
+    esb_set_base_address_0(addr + 1);
+    uint8_t prefix[1] = {addr[0]};
+    esb_set_prefixes(prefix, 1);
+
+    // 3. 發送！
+    // esb_write_payload 會自動等待 ACK
+    // 如果收到 ACK，由 ESB 硬體處理，函數返回 0 (成功)
+    // 如果沒收到 ACK (超時)，函數會返回錯誤
+    
+    printk("Pinging %s on CH %d... ", addr_name, channel);
+    
+    err = esb_write_payload(&tx_payload);
+    
+    if (err == 0) {
+        printk(">>> ACK RECEIVED! <<< (TARGET FOUND)\n");
+        return true;
+    } else {
+        printk("No response.\n");
+        return false;
+    }
 }
 
 int main(void)
@@ -78,32 +87,42 @@ int main(void)
     }
     
     k_sleep(K_SECONDS(3));
-    printk("\n=== Pico Tracker Hunter Started ===\n");
-    printk("Hunting on CH %d and %d...\n", CH_A, CH_B);
-    printk("Looking for address 4343434343...\n");
+    printk("\n=== Pico Tracker Active Pinger ===\n");
+    printk("Attempting to wake up the tracker...\n");
 
     if (esb_initialize() != 0) {
         printk("ESB Init Failed\n");
         return 0;
     }
 
-    esb_start_rx();
-
-    int target = CH_A;
-
     while (1) {
-        esb_stop_rx();
-        esb_set_rf_channel(target);
-        esb_start_rx();
+        // 嘗試組合 1: 頻道 73, 地址 43...
+        if (try_ping(CH_A, addr_pico, "ADDR:43")) {
+             // 找到後瘋狂閃爍 LED 或停留
+             k_sleep(K_MSEC(100)); 
+             continue; 
+        }
+
+        // 嘗試組合 2: 頻道 45, 地址 43...
+        if (try_ping(CH_B, addr_pico, "ADDR:43")) {
+             k_sleep(K_MSEC(100)); 
+             continue; 
+        }
+
+        // 嘗試組合 3: 頻道 73, 地址 E7...
+        if (try_ping(CH_A, addr_default, "ADDR:E7")) {
+             k_sleep(K_MSEC(100)); 
+             continue; 
+        }
+
+        // 嘗試組合 4: 頻道 45, 地址 E7...
+        if (try_ping(CH_B, addr_default, "ADDR:E7")) {
+             k_sleep(K_MSEC(100)); 
+             continue; 
+        }
         
-        printk("."); // 心跳點，證明活著
-
-        // 切換頻道
-        if (target == CH_A) target = CH_B;
-        else target = CH_A;
-
-        // 每個頻道停留 150ms (稍微快一點，捕捉廣播)
-        k_sleep(K_MSEC(150));
+        // 稍微休息一下，讓 Log 不要跑太快
+        k_sleep(K_MSEC(100));
     }
     return 0;
 }
