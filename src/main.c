@@ -39,7 +39,8 @@ void raw_radio_init(void) {
 
     // 3. 設定封包格式 (PCNF0)
     // LFLEN=0, S0LEN=0, S1LEN=0 (最簡單結構)
-    nrf_radio_packet_configure(NRF_RADIO, 0, 0, 0);
+    nrf_radio_packet_conf_t packet_conf = {0}; // 將所有欄位初始化為 0
+    nrf_radio_packet_configure(NRF_RADIO, &packet_conf);
 
     // 4. 設定 PCNF1 (關鍵！)
     // MaxLen=32, StatLen=0, Balen=4 (4 byte base), Endian=Little
