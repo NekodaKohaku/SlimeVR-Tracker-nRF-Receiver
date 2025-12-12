@@ -1,127 +1,156 @@
 /*
- * Pico Tracker "Active Pinger"
- * 模擬頭顯發送訊號，誘發 Tracker 回傳 ACK
+ * Pico Tracker "Whitening" Pinger
+ * Features:
+ * 1. Data Whitening Enabled (Critical for Pico)
+ * 2. Auto-cycling Bitrates (1M/2M)
+ * 3. Targeting CH 73 & 45
  */
 
 #include <zephyr/kernel.h>
 #include <zephyr/sys/printk.h>
 #include <zephyr/usb/usb_device.h>
-#include <esb.h>
+#include <hal/nrf_radio.h>
 
-// 定義目標
+// 目標定義
 #define CH_A 73
 #define CH_B 45
+#define ADDR_PICO 0x43434343
+#define ADDR_DFLT 0xE7E7E7E7
 
-// 定義地址
-static const uint8_t addr_pico[5]    = {0x43, 0x43, 0x43, 0x43, 0x43}; // CCCCC
-static const uint8_t addr_default[5] = {0xE7, 0xE7, 0xE7, 0xE7, 0xE7};
+// 模擬 ESB 的底層發送函數 (直接操作暫存器，繞過 OS 限制)
+void raw_radio_init(void) {
+    // 1. 開啟電源
+    nrf_radio_power_set(NRF_RADIO, true);
 
-// 構建一個簡單的 Payload (內容不重要，重要的是能觸發 ACK)
-static uint8_t tx_payload_data[8] = {0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08};
-
-int esb_initialize(void)
-{
-    int err;
-    struct esb_config config = ESB_DEFAULT_CONFIG;
-
-    // 必須使用 PTX (發射模式)
-    config.protocol = ESB_PROTOCOL_ESB_DPL;
-    config.bitrate = ESB_BITRATE_2MBPS; // Pico 99% 是 2Mbps
-    config.mode = ESB_MODE_PTX;
-    config.event_handler = NULL; // 我們不需要處理接收事件，只需要知道發送是否成功
-    config.crc = ESB_CRC_16BIT;
-    config.tx_output_power = 4; // 開到最大功率 +4dBm
-    config.retransmit_delay = 500;
-    config.retransmit_count = 3;
-
-    err = esb_init(&config);
-    if (err) return err;
+    // 2. 設定地址 (Base0 + Prefix0)
+    // 我們將 Prefix 設為地址的最低位元組 (LSB)
+    // 0x43434343 -> Base: 0x43434300, Prefix: 0x43
+    // 但為了簡單，我們這裡設定 Base 為完整 4 Bytes，Prefix 設為 0 (如果硬體允許)
+    // 或者標準拆分：
+    nrf_radio_base0_set(NRF_RADIO, 0x43434343); 
+    nrf_radio_prefix0_set(NRF_RADIO, 0x43); // Pipe 0 使用 Prefix 0x43
     
-    // 設定地址 (雖然是 PTX，但我們要設定發送的目標地址)
-    // 這裡我們動態切換 Base Address，所以在 Init 隨便設一個即可
-    err = esb_set_base_address_0(addr_pico + 1);
-    err = esb_set_prefixes(addr_pico, 1);
+    // 設定 Address 1 為 E7
+    nrf_radio_base1_set(NRF_RADIO, 0xE7E7E7E7);
+    nrf_radio_prefix1_set(NRF_RADIO, 0xE7); // Pipe 1 使用 Prefix 0xE7
+
+    // 啟用 Pipe 0 & 1
+    nrf_radio_rxaddresses_set(NRF_RADIO, 3); 
+
+    // 3. 設定封包格式 (PCNF0)
+    // LFLEN=0, S0LEN=0, S1LEN=0 (最簡單結構)
+    nrf_radio_packet_configure(NRF_RADIO, 0, 0, 0);
+
+    // 4. 設定 PCNF1 (關鍵！)
+    // MaxLen=32, StatLen=0, Balen=4 (4 byte base), Endian=Little
+    // !!! WHITEEN = 1 (開啟白化) !!!
+    NRF_RADIO->PCNF1 = (
+        (32 << RADIO_PCNF1_MAXLEN_Pos) |
+        (4 << RADIO_PCNF1_BALEN_Pos) |
+        (RADIO_PCNF1_WHITEEN_Enabled << RADIO_PCNF1_WHITEEN_Pos) | // 這是我們缺少的！
+        (RADIO_PCNF1_ENDIAN_Little << RADIO_PCNF1_ENDIAN_Pos)
+    );
+
+    // 5. CRC 設定 (16-bit)
+    nrf_radio_crc_configure(NRF_RADIO, RADIO_CRCCNF_LEN_Two, NRF_RADIO_CRC_ADDR_SKIP, 0x11021);
     
-    return 0;
+    // 設定初始 CRC 值
+    NRF_RADIO->CRCINIT = 0xFFFF; // 通常是 0xFFFF
 }
 
-// 發送函式
-bool try_ping(uint8_t channel, const uint8_t *addr, const char *addr_name)
-{
-    int err;
-    struct esb_payload tx_payload = ESB_CREATE_PAYLOAD(0, tx_payload_data);
-    
+bool try_ping_raw(uint8_t channel, uint8_t bitrate_mode) {
     // 1. 設定頻率
-    esb_stop_rx(); // 停止無線電
-    esb_set_rf_channel(channel);
+    nrf_radio_frequency_set(NRF_RADIO, channel);
 
-    // 2. 設定目標地址 (這是關鍵)
-    // ESB 的地址由 Base(4bytes) + Prefix(1byte) 組成
-    // 我們將 addr[0] 作為 Prefix, addr[1-4] 作為 Base0
-    esb_set_base_address_0(addr + 1);
-    uint8_t prefix[1] = {addr[0]};
-    esb_set_prefixes(prefix, 1);
+    // 2. 設定速率
+    // 0 = 1Mbps, 1 = 2Mbps
+    if (bitrate_mode == 1) 
+        nrf_radio_mode_set(NRF_RADIO, NRF_RADIO_MODE_NRF_2MBIT);
+    else 
+        nrf_radio_mode_set(NRF_RADIO, NRF_RADIO_MODE_NRF_1MBIT);
 
-    // 3. 發送！
-    // esb_write_payload 會自動等待 ACK
-    // 如果收到 ACK，由 ESB 硬體處理，函數返回 0 (成功)
-    // 如果沒收到 ACK (超時)，函數會返回錯誤
+    // 3. 設定白化初始值 (Data Whitening IV)
+    // nRF52 的白化通常使用 Channel 號碼作為 IV
+    NRF_RADIO->DATAWHITEIV = channel | 0x40; // bit 6 必須為 1
+
+    // 4. 準備發送數據 (Packet Ptr)
+    static uint8_t packet[10];
+    packet[0] = 0x55; // 隨便塞點東西
+    packet[1] = 0xAA;
+    NRF_RADIO->PACKETPTR = (uint32_t)packet;
+
+    // 5. 啟動 Radio (TX)
+    NRF_RADIO->EVENTS_READY = 0;
+    NRF_RADIO->TASKS_TXEN = 1;
+    while (NRF_RADIO->EVENTS_READY == 0); // 等待 Ready
+
+    // 6. 發送
+    NRF_RADIO->EVENTS_END = 0;
+    NRF_RADIO->TASKS_START = 1;
+    while (NRF_RADIO->EVENTS_END == 0); // 等待發送完成
+
+    // 7. 切換到 RX 等待 ACK (快速切換)
+    // 這是 ESB 的核心，發完馬上聽
+    NRF_RADIO->EVENTS_READY = 0;
+    NRF_RADIO->TASKS_RXEN = 1; // 透過 Shortcut 其實更快，這裡手動做
     
-    printk("Pinging %s on CH %d... ", addr_name, channel);
-    
-    err = esb_write_payload(&tx_payload);
-    
-    if (err == 0) {
-        printk(">>> ACK RECEIVED! <<< (TARGET FOUND)\n");
-        return true;
-    } else {
-        printk("No response.\n");
-        return false;
+    // 等待一小段時間看有沒有 ACK (Timeout 機制)
+    // 簡單的 Busy Wait
+    for (int i = 0; i < 10000; i++) {
+        if (NRF_RADIO->EVENTS_END != 0 && NRF_RADIO->CRCSTATUS == 1) {
+            // 收到東西且 CRC 正確！
+            return true;
+        }
     }
+    
+    NRF_RADIO->TASKS_DISABLE = 1;
+    return false;
 }
 
-int main(void)
-{
+int main(void) {
     if (IS_ENABLED(CONFIG_USB_DEVICE_STACK)) {
         usb_enable(NULL);
     }
     
     k_sleep(K_SECONDS(3));
-    printk("\n=== Pico Tracker Active Pinger ===\n");
-    printk("Attempting to wake up the tracker...\n");
+    printk("\n=== Pico Whitening Pinger ===\n");
+    printk("Attempting to wake up the tracker with WHITENING ENABLED...\n");
 
-    if (esb_initialize() != 0) {
-        printk("ESB Init Failed\n");
-        return 0;
-    }
+    raw_radio_init();
 
     while (1) {
-        // 嘗試組合 1: 頻道 73, 地址 43...
-        if (try_ping(CH_A, addr_pico, "ADDR:43")) {
-             // 找到後瘋狂閃爍 LED 或停留
-             k_sleep(K_MSEC(100)); 
-             continue; 
+        // 嘗試組合
+        bool ack = false;
+
+        // Try CH 73, 2Mbps
+        NRF_RADIO->TXADDRESS = 0; // 用 Address 0 (43...)
+        if (try_ping_raw(73, 1)) {
+            printk("!!! ACK on CH 73 (2Mbps, ADDR 43) !!!\n");
+            k_sleep(K_MSEC(200));
         }
 
-        // 嘗試組合 2: 頻道 45, 地址 43...
-        if (try_ping(CH_B, addr_pico, "ADDR:43")) {
-             k_sleep(K_MSEC(100)); 
-             continue; 
+        // Try CH 45, 2Mbps
+        NRF_RADIO->TXADDRESS = 0;
+        if (try_ping_raw(45, 1)) {
+            printk("!!! ACK on CH 45 (2Mbps, ADDR 43) !!!\n");
+            k_sleep(K_MSEC(200));
         }
 
-        // 嘗試組合 3: 頻道 73, 地址 E7...
-        if (try_ping(CH_A, addr_default, "ADDR:E7")) {
-             k_sleep(K_MSEC(100)); 
-             continue; 
+        // Try CH 73, 1Mbps
+        NRF_RADIO->TXADDRESS = 0;
+        if (try_ping_raw(73, 0)) {
+            printk("!!! ACK on CH 73 (1Mbps, ADDR 43) !!!\n");
+            k_sleep(K_MSEC(200));
         }
 
-        // 嘗試組合 4: 頻道 45, 地址 E7...
-        if (try_ping(CH_B, addr_default, "ADDR:E7")) {
-             k_sleep(K_MSEC(100)); 
-             continue; 
+        // Try with Default Address (E7)
+        NRF_RADIO->TXADDRESS = 1; // 用 Address 1 (E7...)
+        if (try_ping_raw(73, 1)) {
+            printk("!!! ACK on CH 73 (2Mbps, ADDR E7) !!!\n");
+            k_sleep(K_MSEC(200));
         }
-        
-        // 稍微休息一下，讓 Log 不要跑太快
+
+        printk(".");
         k_sleep(K_MSEC(100));
     }
     return 0;
