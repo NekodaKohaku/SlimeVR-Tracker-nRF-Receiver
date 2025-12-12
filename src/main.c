@@ -1,7 +1,9 @@
 /*
- * Pico Tracker "Config Sweeper"
- * Lock: CH 73 & 45
- * Sweep: Endianness (Big/Little) & Whitening (On/Off)
+ * Pico Tracker "Raw Dumper"
+ * Features: 
+ * - CRC Check DISABLED (Receive everything)
+ * - Fixed CH 73 & 45
+ * - Listen for Address 43... and E7...
  */
 
 #include <zephyr/kernel.h>
@@ -9,58 +11,48 @@
 #include <zephyr/usb/usb_device.h>
 #include <hal/nrf_radio.h>
 
-#define CH_A 73
-#define CH_B 45
-
-// 嘗試捕捉的地址 (Pico Special & Default)
-static uint32_t addrs[] = {0x43434343, 0xE7E7E7E7};
-
-void configure_radio(uint8_t channel, bool big_endian, bool whitening) {
-    // 1. Reset
+void radio_init_raw(uint8_t channel) {
     NRF_RADIO->TASKS_DISABLE = 1;
     while (NRF_RADIO->EVENTS_DISABLED == 0);
     NRF_RADIO->EVENTS_DISABLED = 0;
 
-    // 2. Basic
     nrf_radio_power_set(NRF_RADIO, true);
     nrf_radio_frequency_set(NRF_RADIO, channel);
-    nrf_radio_mode_set(NRF_RADIO, NRF_RADIO_MODE_NRF_2MBIT); // Try 2Mbps first
+    nrf_radio_mode_set(NRF_RADIO, NRF_RADIO_MODE_NRF_2MBIT);
 
-    // 3. Addresses
-    nrf_radio_base0_set(NRF_RADIO, addrs[0]);
-    nrf_radio_prefix0_set(NRF_RADIO, addrs[0] & 0xFF); // Prefix = LSB
-    nrf_radio_base1_set(NRF_RADIO, addrs[1]);
-    nrf_radio_prefix1_set(NRF_RADIO, addrs[1] & 0xFF);
-    nrf_radio_rxaddresses_set(NRF_RADIO, 3); // Pipe 0 & 1
+    // 地址設定 (維持原判，這是最可疑的)
+    nrf_radio_base0_set(NRF_RADIO, 0x43434343);
+    nrf_radio_prefix0_set(NRF_RADIO, 0x43);
+    nrf_radio_base1_set(NRF_RADIO, 0xE7E7E7E7);
+    nrf_radio_prefix1_set(NRF_RADIO, 0xE7);
+    nrf_radio_rxaddresses_set(NRF_RADIO, 3); 
 
-    // 4. PCNF0 (8-bit Length)
+    // PCNF0: 8-bit Length
     NRF_RADIO->PCNF0 = (8 << RADIO_PCNF0_LFLEN_Pos);
 
-    // 5. PCNF1 (Dynamic Config)
-    uint32_t pcnf1 = (32 << RADIO_PCNF1_MAXLEN_Pos) | (4 << RADIO_PCNF1_BALEN_Pos);
-    
-    if (big_endian) {
-        pcnf1 |= (RADIO_PCNF1_ENDIAN_Big << RADIO_PCNF1_ENDIAN_Pos);
-    } else {
-        pcnf1 |= (RADIO_PCNF1_ENDIAN_Little << RADIO_PCNF1_ENDIAN_Pos);
-    }
+    // PCNF1: 嘗試 Big Endian + Whitening (這是之前代碼分析最可能的組合)
+    NRF_RADIO->PCNF1 = (
+        (32 << RADIO_PCNF1_MAXLEN_Pos) |
+        (4 << RADIO_PCNF1_BALEN_Pos) |
+        (RADIO_PCNF1_WHITEEN_Enabled << RADIO_PCNF1_WHITEEN_Pos) | 
+        (RADIO_PCNF1_ENDIAN_Big << RADIO_PCNF1_ENDIAN_Pos)
+    );
 
-    if (whitening) {
-        pcnf1 |= (RADIO_PCNF1_WHITEEN_Enabled << RADIO_PCNF1_WHITEEN_Pos);
-    } else {
-        pcnf1 |= (RADIO_PCNF1_WHITEEN_Disabled << RADIO_PCNF1_WHITEEN_Pos);
-    }
-
-    NRF_RADIO->PCNF1 = pcnf1;
-
-    // 6. CRC & Whitening IV
+    // *** 關鍵修改：禁用 CRC ***
+    // 我們不讓硬體丟棄 CRC 錯誤的包，我們全部都要看
+    // 雖然這裡配置了 CRC，但我們在 Main Loop 不檢查 EVENTS_CRCOK
     nrf_radio_crc_configure(NRF_RADIO, RADIO_CRCCNF_LEN_Two, NRF_RADIO_CRC_ADDR_SKIP, 0x11021);
     NRF_RADIO->CRCINIT = 0xFFFF;
     NRF_RADIO->DATAWHITEIV = channel | 0x40;
 
-    // 7. Start RX
-    NRF_RADIO->SHORTS = RADIO_SHORTS_READY_START_Msk | RADIO_SHORTS_END_START_Msk;
-    NRF_RADIO->EVENTS_CRCOK = 0;
+    // Shorts: Address match -> Start (為了抓 payload)
+    // 我們不使用 END_START，我們手動控制
+    NRF_RADIO->SHORTS = RADIO_SHORTS_READY_START_Msk; 
+    
+    NRF_RADIO->EVENTS_READY = 0;
+    NRF_RADIO->EVENTS_END = 0;
+    NRF_RADIO->EVENTS_ADDRESS = 0;
+    
     NRF_RADIO->TASKS_RXEN = 1;
 }
 
@@ -68,49 +60,51 @@ int main(void) {
     if (IS_ENABLED(CONFIG_USB_DEVICE_STACK)) {
         usb_enable(NULL);
     }
-    k_sleep(K_SECONDS(3));
-    printk("\n=== Pico Config Sweeper ===\n");
-    printk("Scanning combinations on CH 73 & 45...\n");
-
-    uint8_t channels[] = {CH_A, CH_B};
-    int ch_idx = 0;
     
-    while (1) {
-        uint8_t ch = channels[ch_idx];
-        
-        // 嘗試 4 種組合
-        for (int i = 0; i < 4; i++) {
-            bool big_endian = (i & 1);
-            bool whitening = (i & 2);
+    k_sleep(K_SECONDS(3));
+    printk("=== Pico Raw Dumper ===\n");
+    printk("CRC Check Ignored. Expect NOISE.\n");
+    printk("Look for REPEATING patterns.\n");
 
-            configure_radio(ch, big_endian, whitening);
-            
-            // 每個設定聽 150ms
-            for (int k = 0; k < 15; k++) {
-                if (NRF_RADIO->EVENTS_CRCOK) {
-                    NRF_RADIO->EVENTS_CRCOK = 0;
-                    printk("\n!!! MATCH FOUND !!!\n");
-                    printk("CH: %d | Endian: %s | White: %s\n", 
-                           ch, 
-                           big_endian ? "BIG" : "LITTLE", 
-                           whitening ? "ON" : "OFF");
-                    
-                    // 鎖定成功，不再切換，專心接收
-                    while(1) {
-                        if (NRF_RADIO->EVENTS_CRCOK) {
-                            NRF_RADIO->EVENTS_CRCOK = 0;
-                            printk("!"); // 收到數據包
-                        }
-                        k_sleep(K_MSEC(1));
-                    }
-                }
-                k_sleep(K_MSEC(10));
-            }
-        }
+    int channel = 73;
+    int toggle = 0;
+
+    while (1) {
+        channel = (toggle++ % 2 == 0) ? 73 : 45;
+        radio_init_raw(channel);
         
-        // 切換頻道
-        ch_idx = (ch_idx + 1) % 2;
-        printk(".");
+        printk("\n[Listening CH %d] ", channel);
+
+        // 每個頻道聽 500ms
+        for(int i=0; i<50; i++) {
+            // 如果偵測到「地址匹配」(EVENTS_ADDRESS)，說明有人在說話
+            // 即使後面 CRC 錯了，我們也要把數據印出來
+            if (NRF_RADIO->EVENTS_ADDRESS) {
+                NRF_RADIO->EVENTS_ADDRESS = 0;
+                
+                // 等待 Payload 接收完畢
+                while(NRF_RADIO->EVENTS_END == 0);
+                NRF_RADIO->EVENTS_END = 0;
+
+                // 讀取數據 (Packet Ptr 沒設，預設會亂指，我們這裡簡單讀 CRCStatus 來判斷有無訊號)
+                // 在沒有 EasyDMA 的簡單模式下，我們只能知道「有訊號」
+                
+                printk("!"); // ! 代表收到符合地址的訊號
+                
+                if (NRF_RADIO->CRCSTATUS) {
+                    printk("[CRC OK]"); // 居然對了？
+                } else {
+                    printk("[CRC ERR]"); // 預期會看到這個
+                }
+
+                // 為了避免洗版，重新啟動
+                NRF_RADIO->TASKS_DISABLE = 1;
+                while(NRF_RADIO->EVENTS_DISABLED == 0);
+                NRF_RADIO->EVENTS_DISABLED = 0;
+                NRF_RADIO->TASKS_RXEN = 1;
+            }
+            k_sleep(K_MSEC(10));
+        }
     }
     return 0;
 }
