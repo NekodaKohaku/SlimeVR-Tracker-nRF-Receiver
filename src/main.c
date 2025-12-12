@@ -1,5 +1,5 @@
 /*
- * Pico Tracker "Gatling Gun" Pinger
+ * Pico Tracker "Gatling Gun" Pinger (Fixed)
  * Strategy: Brute-force sweep ALL channels (0-99)
  * Goal: Trigger Auto-ACK on ANY channel
  */
@@ -31,7 +31,7 @@ void radio_init_generic(void) {
     nrf_radio_prefix1_set(NRF_RADIO, 0xE7);
     nrf_radio_rxaddresses_set(NRF_RADIO, 3); // Pipe 0 & 1
 
-    // 5. 封包格式 (修正版)
+    // 5. 封包格式
     // LFLEN=8 bits (標準 ESB), S0=0, S1=0
     NRF_RADIO->PCNF0 = (8 << RADIO_PCNF0_LFLEN_Pos);
 
@@ -49,10 +49,6 @@ void radio_init_generic(void) {
 
     // 8. 設定 Packet Pointer
     NRF_RADIO->PACKETPTR = (uint32_t)packet_data;
-
-    // 9. 關鍵 Shortcut: 發送完馬上轉接收 (等待 ACK)
-    // READY->START is manual. 
-    // END->DISABLE is manual (to check events).
 }
 
 // 在特定頻道發射並等待 ACK
@@ -61,8 +57,9 @@ bool shoot_and_listen(uint8_t channel, uint8_t tx_addr_idx) {
     NRF_RADIO->FREQUENCY = channel;
     // 設定白化初始值 (必須跟頻率有關)
     NRF_RADIO->DATAWHITEIV = channel | 0x40;
-    // 設定發送地址
-    NRF_RADIO->TXADDRESS = tx_addr_index;
+    
+    // *** 修正點：使用正確的變數名稱 tx_addr_idx ***
+    NRF_RADIO->TXADDRESS = tx_addr_idx; 
 
     // --- 1. 發送 (TX) ---
     NRF_RADIO->SHORTS = RADIO_SHORTS_READY_START_Msk | RADIO_SHORTS_END_DISABLE_Msk;
@@ -102,7 +99,7 @@ int main(void) {
         usb_enable(NULL);
     }
     k_sleep(K_SECONDS(3));
-    printk("=== Pico Tracker Gatling Gun ===\n");
+    printk("=== Pico Tracker Gatling Gun (Fixed) ===\n");
     printk("Sweeping CH 0-99 with Whitening ON...\n");
 
     radio_init_generic();
