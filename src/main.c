@@ -1,110 +1,96 @@
 /*
- * Pico Tracker "BLE Hunter" (Fixed USB)
- * Target: Standard BLE Advertising Packets
- * Channels: 37 (2402), 38 (2426), 39 (2480)
- * Access Address: 0x8E89BED6
+ * Pico Tracker "Spectrum Analyzer"
+ * Purpose: Find the transmitting frequency by measuring signal strength (RSSI)
+ * Method: Sweep all 2.4GHz frequencies, print only STRONG signals (> -50dBm)
  */
 
 #include <zephyr/kernel.h>
 #include <zephyr/sys/printk.h>
-// *** 補上這行：USB 必要標頭檔 ***
-#include <zephyr/usb/usb_device.h> 
+#include <zephyr/usb/usb_device.h>
 #include <hal/nrf_radio.h>
 
-// BLE 廣播頻率
-#define FREQ_CH_37 2
-#define FREQ_CH_38 26
-#define FREQ_CH_39 80
-
-void radio_init_ble(uint8_t freq) {
-    // 1. Reset
+void radio_init_rssi(uint8_t freq) {
+    // 1. Reset Radio
     NRF_RADIO->TASKS_DISABLE = 1;
     while (NRF_RADIO->EVENTS_DISABLED == 0);
     NRF_RADIO->EVENTS_DISABLED = 0;
 
-    // 2. Config
+    // 2. Power ON
     nrf_radio_power_set(NRF_RADIO, true);
+    
+    // 3. Set Frequency (0-100, mapping to 2400+N MHz)
     nrf_radio_frequency_set(NRF_RADIO, freq);
     
-    // BLE 廣播通常使用 1Mbps
+    // 4. Mode: 1Mbps (Doesn't matter for RSSI, but needed to start RX)
     nrf_radio_mode_set(NRF_RADIO, NRF_RADIO_MODE_BLE_1MBIT);
 
-    // 3. BLE Access Address (固定為 0x8E89BED6)
-    nrf_radio_base0_set(NRF_RADIO, 0x89BED600);
-    nrf_radio_prefix0_set(NRF_RADIO, 0x8E);
-    nrf_radio_rxaddresses_set(NRF_RADIO, 1); 
-
-    // 4. PCNF0 (BLE 格式)
-    NRF_RADIO->PCNF0 = (
-        (8 << RADIO_PCNF0_LFLEN_Pos) |
-        (1 << RADIO_PCNF0_S0LEN_Pos) |
-        (0 << RADIO_PCNF0_S1LEN_Pos)
-    );
-
-    // 5. PCNF1 (WhiteEn=1, Balen=3)
-    NRF_RADIO->PCNF1 = (
-        (37 << RADIO_PCNF1_MAXLEN_Pos) |
-        (0 << RADIO_PCNF1_STATLEN_Pos) |
-        (3 << RADIO_PCNF1_BALEN_Pos) |
-        (RADIO_PCNF1_WHITEEN_Enabled << RADIO_PCNF1_WHITEEN_Pos) |
-        (RADIO_PCNF1_ENDIAN_Little << RADIO_PCNF1_ENDIAN_Pos)
-    );
-
-    // 6. CRC (BLE 是 24-bit CRC)
-    NRF_RADIO->CRCCNF = (RADIO_CRCCNF_LEN_Three << RADIO_CRCCNF_LEN_Pos) |
-                        (RADIO_CRCCNF_SKIPADDR_Skip << RADIO_CRCCNF_SKIPADDR_Pos);
-    NRF_RADIO->CRCPOLY = 0x00065B;
-    NRF_RADIO->CRCINIT = 0x555555;
-
-    // 7. Whitening IV (BLE Channel Index)
-    uint8_t chan_idx = 0;
-    if (freq == 2) chan_idx = 37;
-    else if (freq == 26) chan_idx = 38;
-    else if (freq == 80) chan_idx = 39;
+    // 5. Shortcuts: Ready -> Start
+    NRF_RADIO->SHORTS = RADIO_SHORTS_READY_START_Msk;
     
-    NRF_RADIO->DATAWHITEIV = chan_idx | 0x40;
-
-    // 8. Start RX
-    NRF_RADIO->SHORTS = RADIO_SHORTS_READY_START_Msk | RADIO_SHORTS_END_START_Msk;
+    // 6. Start RX
     NRF_RADIO->TASKS_RXEN = 1;
+    while (NRF_RADIO->EVENTS_STARTED == 0); // Wait for radio to start
+    NRF_RADIO->EVENTS_STARTED = 0;
+}
+
+int8_t get_rssi(void) {
+    // Start RSSI measurement
+    NRF_RADIO->TASKS_RSSISTART = 1;
+    while (NRF_RADIO->EVENTS_RSSIEND == 0); // Wait for measurement
+    NRF_RADIO->EVENTS_RSSIEND = 0;
+    
+    // Read value (value is negative dBm, but register stores positive)
+    uint8_t rssi_sample = NRF_RADIO->RSSISAMPLE;
+    
+    // Stop RSSI
+    NRF_RADIO->TASKS_RSSISTOP = 1;
+    
+    return -((int8_t)rssi_sample);
 }
 
 int main(void) {
-    // *** 補上這段：啟動 USB ***
+    // Enable USB
     if (IS_ENABLED(CONFIG_USB_DEVICE_STACK)) {
-        int ret = usb_enable(NULL);
-        if (ret != 0) {
-            return 0; // 如果啟動失敗就停在這
-        }
+        usb_enable(NULL);
     }
-    // *************************
-
+    
     k_sleep(K_SECONDS(2));
-    printk("=== Pico BLE Hunter ===\n");
-    printk("Listening on BLE Adv Channels (37, 38, 39)...\n");
-
-    int ch_state = 0;
-    uint8_t current_freq = FREQ_CH_37;
+    printk("=== Pico Spectrum Analyzer ===\n");
+    printk("Searching for STRONG signals (> -50 dBm)...\n");
+    printk("Please hold the tracker VERY close to the dongle.\n");
 
     while (1) {
-        if (ch_state == 0) current_freq = FREQ_CH_37;
-        else if (ch_state == 1) current_freq = FREQ_CH_38;
-        else current_freq = FREQ_CH_39;
-
-        radio_init_ble(current_freq);
-
-        // 每個頻道聽 200ms
-        for (int i = 0; i < 200; i++) {
-            if (NRF_RADIO->EVENTS_CRCOK) {
-                NRF_RADIO->EVENTS_CRCOK = 0;
+        // Sweep standard BLE Advertising Channels FIRST
+        // Ch37=2402, Ch38=2426, Ch39=2480
+        uint8_t target_freqs[] = {2, 26, 80}; 
+        
+        for (int i = 0; i < 3; i++) {
+            uint8_t f = target_freqs[i];
+            
+            radio_init_rssi(f);
+            k_busy_wait(100); // Wait stable
+            
+            int8_t rssi = get_rssi();
+            
+            // 如果訊號很強 (大於 -50dBm)，代表就在旁邊！
+            if (rssi > -55) {
+                printk("\n[DETECTED] Freq: 24%02d MHz | RSSI: %d dBm", f, rssi);
+                if (f == 2) printk(" (BLE CH 37)");
+                if (f == 26) printk(" (BLE CH 38)");
+                if (f == 80) printk(" (BLE CH 39)");
+                printk("\n");
                 
-                printk("\n!!! BLE PACKET DETECTED on CH %d !!!\n", (ch_state+37));
-                k_sleep(K_MSEC(10));
+                // 抓到強訊號後，快速多測幾次確認
+                for(int k=0; k<10; k++) {
+                    printk("*");
+                    k_busy_wait(50000); // 50ms
+                }
             }
-            k_sleep(K_MSEC(1));
         }
-
-        ch_state = (ch_state + 1) % 3;
+        
+        // 為了不洗版，沒訊號時我們沉默，或者印個點
+        // printk("."); 
+        k_sleep(K_MSEC(10));
     }
     return 0;
 }
