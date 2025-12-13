@@ -1,9 +1,9 @@
 /*
- * Pico Tracker "All-Seeing Eye" Scanner
+ * Pico Tracker "All-Seeing Eye" Scanner (Fixed)
  * Features: 
  * 1. Standard BLE 1M
- * 2. Coded PHY (Long Range) - 可能藏在這裡！
- * 3. Extended Advertising
+ * 2. Coded PHY (Long Range)
+ * 3. Extended Advertising (Enabled via Config)
  */
 
 #include <zephyr/kernel.h>
@@ -16,18 +16,17 @@
 static void scan_cb(const bt_addr_le_t *addr, int8_t rssi, uint8_t adv_type,
                     struct net_buf_simple *buf)
 {
-    // 過濾掉太遠的雜訊，只顯示貼在旁邊的裝置
-    if (rssi < -60) return;
+    // 過濾掉太遠的雜訊
+    if (rssi < -75) return;
 
     char addr_str[BT_ADDR_LE_STR_LEN];
     bt_addr_le_to_str(addr, addr_str, sizeof(addr_str));
 
-    printk("\n[FOUND] Device: %s | RSSI: %d dBm\n", addr_str, rssi);
+    printk("\n[FOUND] Device: %s | RSSI: %d dBm | Type: %d\n", addr_str, rssi, adv_type);
     
-    // 簡單辨識廠商
-    // Pico 的 MAC 地址通常可能不是固定的，但我們可以看訊號強度
-    if (rssi > -40) {
-        printk(">>> TARGET LOCATED! (Very Strong Signal) <<<\n");
+    // 如果訊號很強，標記出來
+    if (rssi > -45) {
+        printk(">>> STRONG SIGNAL NEARBY! <<<\n");
     }
 }
 
@@ -49,10 +48,12 @@ int main(void)
         return 0;
     }
 
-    // 3. 設定掃描參數 (開啟所有模式)
+    // 3. 設定掃描參數
+    // 修正說明：移除了 BT_LE_SCAN_OPT_EXT_ADV，因為 Config 已啟用
     struct bt_le_scan_param scan_param = {
-        .type       = BT_LE_SCAN_TYPE_ACTIVE,   // 主動詢問
-        .options    = BT_LE_SCAN_OPT_CODED | BT_LE_SCAN_OPT_EXT_ADV, // 關鍵：開啟 Coded 和 Extended
+        .type       = BT_LE_SCAN_TYPE_ACTIVE,
+        // 只保留 Coded PHY 選項，Extended Adv 由底層自動處理
+        .options    = BT_LE_SCAN_OPT_CODED, 
         .interval   = BT_GAP_SCAN_FAST_INTERVAL,
         .window     = BT_GAP_SCAN_FAST_WINDOW,
     };
