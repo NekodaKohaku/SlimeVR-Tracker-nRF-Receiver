@@ -1,96 +1,73 @@
 /*
- * Pico Tracker "Spectrum Analyzer"
- * Purpose: Find the transmitting frequency by measuring signal strength (RSSI)
- * Method: Sweep all 2.4GHz frequencies, print only STRONG signals (> -50dBm)
+ * Pico Tracker "All-Seeing Eye" Scanner
+ * Features: 
+ * 1. Standard BLE 1M
+ * 2. Coded PHY (Long Range) - 可能藏在這裡！
+ * 3. Extended Advertising
  */
 
 #include <zephyr/kernel.h>
 #include <zephyr/sys/printk.h>
 #include <zephyr/usb/usb_device.h>
-#include <hal/nrf_radio.h>
+#include <zephyr/bluetooth/bluetooth.h>
+#include <zephyr/bluetooth/hci.h>
 
-void radio_init_rssi(uint8_t freq) {
-    // 1. Reset Radio
-    NRF_RADIO->TASKS_DISABLE = 1;
-    while (NRF_RADIO->EVENTS_DISABLED == 0);
-    NRF_RADIO->EVENTS_DISABLED = 0;
+// 掃描回調函數
+static void scan_cb(const bt_addr_le_t *addr, int8_t rssi, uint8_t adv_type,
+                    struct net_buf_simple *buf)
+{
+    // 過濾掉太遠的雜訊，只顯示貼在旁邊的裝置
+    if (rssi < -60) return;
 
-    // 2. Power ON
-    nrf_radio_power_set(NRF_RADIO, true);
-    
-    // 3. Set Frequency (0-100, mapping to 2400+N MHz)
-    nrf_radio_frequency_set(NRF_RADIO, freq);
-    
-    // 4. Mode: 1Mbps (Doesn't matter for RSSI, but needed to start RX)
-    nrf_radio_mode_set(NRF_RADIO, NRF_RADIO_MODE_BLE_1MBIT);
+    char addr_str[BT_ADDR_LE_STR_LEN];
+    bt_addr_le_to_str(addr, addr_str, sizeof(addr_str));
 
-    // 5. Shortcuts: Ready -> Start
-    NRF_RADIO->SHORTS = RADIO_SHORTS_READY_START_Msk;
+    printk("\n[FOUND] Device: %s | RSSI: %d dBm\n", addr_str, rssi);
     
-    // 6. Start RX
-    NRF_RADIO->TASKS_RXEN = 1;
-    while (NRF_RADIO->EVENTS_STARTED == 0); // Wait for radio to start
-    NRF_RADIO->EVENTS_STARTED = 0;
+    // 簡單辨識廠商
+    // Pico 的 MAC 地址通常可能不是固定的，但我們可以看訊號強度
+    if (rssi > -40) {
+        printk(">>> TARGET LOCATED! (Very Strong Signal) <<<\n");
+    }
 }
 
-int8_t get_rssi(void) {
-    // Start RSSI measurement
-    NRF_RADIO->TASKS_RSSISTART = 1;
-    while (NRF_RADIO->EVENTS_RSSIEND == 0); // Wait for measurement
-    NRF_RADIO->EVENTS_RSSIEND = 0;
-    
-    // Read value (value is negative dBm, but register stores positive)
-    uint8_t rssi_sample = NRF_RADIO->RSSISAMPLE;
-    
-    // Stop RSSI
-    NRF_RADIO->TASKS_RSSISTOP = 1;
-    
-    return -((int8_t)rssi_sample);
-}
-
-int main(void) {
-    // Enable USB
+int main(void)
+{
+    // 1. 啟動 USB
     if (IS_ENABLED(CONFIG_USB_DEVICE_STACK)) {
         usb_enable(NULL);
     }
-    
-    k_sleep(K_SECONDS(2));
-    printk("=== Pico Spectrum Analyzer ===\n");
-    printk("Searching for STRONG signals (> -50 dBm)...\n");
-    printk("Please hold the tracker VERY close to the dongle.\n");
+
+    k_sleep(K_SECONDS(3));
+    printk("=== Pico All-PHY Scanner ===\n");
+    printk("Scanning: 1M / Coded PHY / Extended Adv\n");
+
+    // 2. 初始化藍牙
+    int err = bt_enable(NULL);
+    if (err) {
+        printk("Bluetooth init failed (err %d)\n", err);
+        return 0;
+    }
+
+    // 3. 設定掃描參數 (開啟所有模式)
+    struct bt_le_scan_param scan_param = {
+        .type       = BT_LE_SCAN_TYPE_ACTIVE,   // 主動詢問
+        .options    = BT_LE_SCAN_OPT_CODED | BT_LE_SCAN_OPT_EXT_ADV, // 關鍵：開啟 Coded 和 Extended
+        .interval   = BT_GAP_SCAN_FAST_INTERVAL,
+        .window     = BT_GAP_SCAN_FAST_WINDOW,
+    };
+
+    // 4. 開始掃描
+    err = bt_le_scan_start(&scan_param, scan_cb);
+    if (err) {
+        printk("Scanning start failed (err %d)\n", err);
+        return 0;
+    }
+
+    printk("Scanning started... Hold tracker close!\n");
 
     while (1) {
-        // Sweep standard BLE Advertising Channels FIRST
-        // Ch37=2402, Ch38=2426, Ch39=2480
-        uint8_t target_freqs[] = {2, 26, 80}; 
-        
-        for (int i = 0; i < 3; i++) {
-            uint8_t f = target_freqs[i];
-            
-            radio_init_rssi(f);
-            k_busy_wait(100); // Wait stable
-            
-            int8_t rssi = get_rssi();
-            
-            // 如果訊號很強 (大於 -50dBm)，代表就在旁邊！
-            if (rssi > -55) {
-                printk("\n[DETECTED] Freq: 24%02d MHz | RSSI: %d dBm", f, rssi);
-                if (f == 2) printk(" (BLE CH 37)");
-                if (f == 26) printk(" (BLE CH 38)");
-                if (f == 80) printk(" (BLE CH 39)");
-                printk("\n");
-                
-                // 抓到強訊號後，快速多測幾次確認
-                for(int k=0; k<10; k++) {
-                    printk("*");
-                    k_busy_wait(50000); // 50ms
-                }
-            }
-        }
-        
-        // 為了不洗版，沒訊號時我們沉默，或者印個點
-        // printk("."); 
-        k_sleep(K_MSEC(10));
+        k_sleep(K_SECONDS(1));
     }
     return 0;
 }
