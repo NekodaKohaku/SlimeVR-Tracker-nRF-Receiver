@@ -1,112 +1,80 @@
 /*
- * Pico Universal Scanner (Speed Auto-Switch)
- * Target: Ch 37 (Fixed)
- * Strategy: Toggle between 1Mbit and 2Mbit modes to find the correct speed.
- * Filter: RSSI < 75 (Strong signals only)
+ * Copyright (c) 2025 White Cat DIY
+ * Pico Tracker Reverse Engineering - Frequency Sweeper
  */
 
 #include <zephyr/kernel.h>
 #include <zephyr/sys/printk.h>
 #include <hal/nrf_radio.h>
-#include <zephyr/usb/usb_device.h>
-#include <zephyr/drivers/uart.h>
 
-#define TARGET_FREQ 37 
-#define RSSI_THRESHOLD 75 // 只顯示強訊號
+// 設定掃描參數
+#define SCAN_DELAY_MS 20       // 每個頻道的停留時間 (毫秒)
+#define RSSI_THRESHOLD -50     // 訊號過濾門檻 (只顯示比這強的訊號)
 
-// 兩種速度模式
-enum { MODE_1MBIT = 0, MODE_2MBIT = 1 };
-const char *mode_str[] = {"1Mbit", "2Mbit"};
+// 直接操作硬體暫存器，速度最快
+void radio_configure(void)
+{
+    // 1. 關閉 Radio 以便設定
+    nrf_radio_task_trigger(NRF_RADIO, NRF_RADIO_TASK_DISABLE);
+    
+    // 2. 設定為 2Mbit (Pico Tracker 幾乎肯定是 2Mbit)
+    // 如果掃不到，可以改回 NRF_RADIO_MODE_BLE_1MBIT 試試
+    nrf_radio_mode_set(NRF_RADIO, NRF_RADIO_MODE_BLE_2MBIT);
 
-void radio_config(int mode, uint8_t prefix) {
-    NRF_RADIO->TASKS_DISABLE = 1;
-    while (NRF_RADIO->EVENTS_DISABLED == 0);
-    NRF_RADIO->EVENTS_DISABLED = 0;
+    // 3. 設定發射功率為 0 dBm (雖然我們只收不發)
+    nrf_radio_txpower_set(NRF_RADIO, NRF_RADIO_TXPOWER_0DBM);
 
-    // 自動切換速度
-    if (mode == MODE_1MBIT) {
-        nrf_radio_mode_set(NRF_RADIO, NRF_RADIO_MODE_NRF_1MBIT);
-    } else {
-        nrf_radio_mode_set(NRF_RADIO, NRF_RADIO_MODE_NRF_2MBIT);
-    }
-
-    nrf_radio_frequency_set(NRF_RADIO, TARGET_FREQ);
-
-    // 1-Byte Address (BALEN=0)
-    nrf_radio_prefix0_set(NRF_RADIO, prefix); 
-    nrf_radio_rxaddresses_set(NRF_RADIO, 1); 
-
-    // PCNF0: S1LEN=4 (Based on previous dump)
-    NRF_RADIO->PCNF0 = (8 << RADIO_PCNF0_LFLEN_Pos) | (4 << RADIO_PCNF0_S1LEN_Pos);
-
-    // PCNF1: BALEN=0
-    NRF_RADIO->PCNF1 = (32 << RADIO_PCNF1_MAXLEN_Pos) | 
-                       (0 << RADIO_PCNF1_BALEN_Pos) | 
-                       (RADIO_PCNF1_ENDIAN_Little << RADIO_PCNF1_ENDIAN_Pos) |
-                       (RADIO_PCNF1_WHITEEN_Disabled << RADIO_PCNF1_WHITEEN_Pos);
-
-    NRF_RADIO->CRCCNF = (RADIO_CRCCNF_LEN_Two << RADIO_CRCCNF_LEN_Pos) |
-                        (RADIO_CRCCNF_SKIPADDR_Include << RADIO_CRCCNF_SKIPADDR_Pos);
-    NRF_RADIO->CRCPOLY = 0x11021; 
-    NRF_RADIO->CRCINIT = 0xFFFF;
-
-    NRF_RADIO->SHORTS = RADIO_SHORTS_READY_START_Msk | RADIO_SHORTS_END_START_Msk;
-    NRF_RADIO->TASKS_RXEN = 1;
+    // 4. 設定 Fast Ramp-up
+    nrf_radio_modecnf0_set(NRF_RADIO, true, 0);
 }
 
-int main(void) {
-    if (usb_enable(NULL)) return 0;
-    
-    const struct device *dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_console));
-    uint32_t dtr = 0;
-    while (!dtr) {
-        uart_line_ctrl_get(dev, UART_LINE_CTRL_DTR, &dtr);
-        k_sleep(K_MSEC(100));
-    }
+int main(void)
+{
+    printk("*** Pico Universal Frequency Sweeper Started ***\n");
+    printk("Scanning 2402 MHz - 2480 MHz for STRONG signals ( > %d dBm)...\n", RSSI_THRESHOLD);
 
-    printk("\n=== Pico Universal Scanner ===\n");
-    printk("Cycling 1Mbit <-> 2Mbit on CH 37...\n");
-
-    uint16_t current_prefix = 0;
-    int current_mode = MODE_2MBIT;
+    radio_configure();
 
     while (1) {
-        radio_config(current_mode, (uint8_t)current_prefix);
+        // 頻率迴圈：從 2402 (CH 2) 掃到 2480 (CH 80)
+        // 這是 2.4GHz ISM 頻段的範圍
+        for (int freq = 2; freq <= 80; freq++) {
+            
+            // 1. 設定頻率 (2400 + freq MHz)
+            nrf_radio_frequency_set(NRF_RADIO, freq);
 
-        // 每個模式聽 40ms
-        for (int i = 0; i < 4; i++) {
-            if (NRF_RADIO->EVENTS_ADDRESS) {
-                NRF_RADIO->EVENTS_ADDRESS = 0;
-                
-                NRF_RADIO->TASKS_RSSISTART = 1;
-                while(!NRF_RADIO->EVENTS_RSSIEND);
-                NRF_RADIO->EVENTS_RSSIEND = 0;
-                uint8_t rssi = NRF_RADIO->RSSISAMPLE;
+            // 2. 啟動接收 (RX)
+            nrf_radio_task_trigger(NRF_RADIO, NRF_RADIO_TASK_RXEN);
+            
+            // 等待 Radio 準備好 (Ready)
+            // 在 nRF52/53 上，RXEN -> READY 需要幾十微秒
+            k_busy_wait(150); 
 
-                if (rssi < RSSI_THRESHOLD) {
-                    printk("\n>>> HIT! Mode: %s | Prefix: 0x%02X (RSSI: -%d) <<<\n", 
-                           mode_str[current_mode], (uint8_t)current_prefix, rssi);
-                    
-                    if (NRF_RADIO->EVENTS_CRCOK) {
-                        printk("!!! CRC OK !!! LOCKED!\n");
-                        // 鎖定成功
-                        while(1) k_sleep(K_FOREVER);
-                    }
-                }
+            // 3. 啟動 RSSI 測量
+            nrf_radio_task_trigger(NRF_RADIO, NRF_RADIO_TASK_RSSISTART);
+            
+            // 等待測量完成 (稍微等一下確保採樣準確)
+            k_busy_wait(50); // 實際上 RSSI 採樣很快，但給它一點時間捕捉
+
+            // 4. 讀取 RSSI 數值
+            // nrf_radio_rssi_sample_get() 回傳的是正整數 (例如 60 代表 -60dBm)
+            uint8_t sample = nrf_radio_rssi_sample_get(NRF_RADIO);
+            int rssi = -1 * (int)sample;
+
+            // 5. 判斷並顯示
+            if (rssi > RSSI_THRESHOLD) {
+                printk(">>> [HIT] Freq: 24%02d MHz | RSSI: %d dBm <<<\n", freq, rssi);
             }
-            k_busy_wait(10000); 
-        }
 
-        // 切換邏輯：掃完一個 Prefix，就換一種速度再掃一次
-        // 這樣確保每個地址都被兩種速度檢查過
-        current_mode = !current_mode;
+            // 6. 停止 RSSI 和 RX，準備切換下一個頻率
+            nrf_radio_task_trigger(NRF_RADIO, NRF_RADIO_TASK_RSSISTOP);
+            nrf_radio_task_trigger(NRF_RADIO, NRF_RADIO_TASK_DISABLE);
+            
+            // 讓 CPU 休息一下，避免 Watchdog 叫，也能控制掃描速度
+            k_msleep(SCAN_DELAY_MS);
+        }
         
-        if (current_mode == MODE_2MBIT) { // 每兩次循環換一個地址
-            current_prefix++;
-            if (current_prefix > 0xFF) {
-                current_prefix = 0;
-                // printk("."); 
-            }
-        }
+        // 掃完一輪印個分隔線，方便閱讀
+        // printk("--- Loop Complete ---\n");
     }
 }
