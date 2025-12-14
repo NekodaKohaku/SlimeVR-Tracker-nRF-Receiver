@@ -1,8 +1,8 @@
 /*
- * Pico Hardware Signal Detector
- * Strategy: Ignore CRC. Listen ONLY for the specific hardware address pattern.
- * Address: 0x23 + 0x43434343
- * Channels: 1, 37, 77
+ * Pico Prefix Brute Force (Base 0x43434343)
+ * Strategy: Keep Base fixed, rotate Prefix 0x00-0xFF
+ * Channel: 77 (Fixed)
+ * Endian: Little (Based on dump)
  */
 
 #include <zephyr/kernel.h>
@@ -11,48 +11,31 @@
 #include <zephyr/usb/usb_device.h>
 #include <zephyr/drivers/uart.h>
 
-// 這是我們唯一確信的真理
-#define ADDR_BASE1       0x43434343 
-#define ADDR_PREFIX0     0x23C343C0  // 我們只在乎 0x23 (Byte 3)
+#define ADDR_BASE_TARGET  0x43434343 // 我們最信任的基底
 
-static uint8_t target_channels[] = {1, 37, 77};
-static int ch_index = 0;
-
-// 測試兩種可能的端序
-enum { ENDIAN_LITTLE = 0, ENDIAN_BIG = 1 };
-static int current_endian = ENDIAN_BIG; // 先猜 Big (VR 設備常用)
-
-void radio_config(uint8_t channel, int endian) {
+void radio_config(uint8_t prefix) {
     NRF_RADIO->TASKS_DISABLE = 1;
     while (NRF_RADIO->EVENTS_DISABLED == 0);
     NRF_RADIO->EVENTS_DISABLED = 0;
 
     nrf_radio_mode_set(NRF_RADIO, NRF_RADIO_MODE_NRF_2MBIT);
-    nrf_radio_frequency_set(NRF_RADIO, channel);
+    nrf_radio_frequency_set(NRF_RADIO, 77); // 死守 Channel 77
 
-    // 設定地址 (Base1 + Prefix Byte 3)
-    nrf_radio_base1_set(NRF_RADIO, ADDR_BASE1); 
-    nrf_radio_prefix0_set(NRF_RADIO, ADDR_PREFIX0); 
-    // 只聽 Address 3 (0x08)
-    nrf_radio_rxaddresses_set(NRF_RADIO, 0x08); 
+    // 設定地址：Base 固定，Prefix 變動
+    nrf_radio_base0_set(NRF_RADIO, ADDR_BASE_TARGET); 
+    nrf_radio_prefix0_set(NRF_RADIO, prefix); // 測試這個 Prefix
+    nrf_radio_rxaddresses_set(NRF_RADIO, 1);  // Enable Logical Address 0
 
-    // PCNF0: 標準 ESB (LFLEN=8, S0=0, S1=0)
-    // 我們先把 S1 設為 0，避免因為 S1 設定錯誤導致收不到
-    NRF_RADIO->PCNF0 = (8 << RADIO_PCNF0_LFLEN_Pos);
+    // PCNF0: Standard
+    NRF_RADIO->PCNF0 = (8 << RADIO_PCNF0_LFLEN_Pos) | (4 << RADIO_PCNF0_S1LEN_Pos);
 
-    // PCNF1: 恢復標準 BALEN=4
-    uint32_t pcnf1 = (32 << RADIO_PCNF1_MAXLEN_Pos) | 
-                     (4 << RADIO_PCNF1_BALEN_Pos) | // 相信標準，不信 Dump
-                     (RADIO_PCNF1_WHITEEN_Disabled << RADIO_PCNF1_WHITEEN_Pos);
+    // PCNF1: Standard BALEN=4, Little Endian, No Whitening
+    NRF_RADIO->PCNF1 = (32 << RADIO_PCNF1_MAXLEN_Pos) | 
+                       (4 << RADIO_PCNF1_BALEN_Pos) | // 標準 4-byte Base
+                       (RADIO_PCNF1_ENDIAN_Little << RADIO_PCNF1_ENDIAN_Pos) |
+                       (RADIO_PCNF1_WHITEEN_Disabled << RADIO_PCNF1_WHITEEN_Pos);
 
-    if (endian == ENDIAN_BIG) {
-        pcnf1 |= (RADIO_PCNF1_ENDIAN_Big << RADIO_PCNF1_ENDIAN_Pos);
-    } else {
-        pcnf1 |= (RADIO_PCNF1_ENDIAN_Little << RADIO_PCNF1_ENDIAN_Pos);
-    }
-    NRF_RADIO->PCNF1 = pcnf1;
-
-    // CRC: 隨便設，反正我們只看 Address Match
+    // CRC (Doesn't matter for address match, but set it anyway)
     NRF_RADIO->CRCCNF = (RADIO_CRCCNF_LEN_Two << RADIO_CRCCNF_LEN_Pos) |
                         (RADIO_CRCCNF_SKIPADDR_Include << RADIO_CRCCNF_SKIPADDR_Pos);
     NRF_RADIO->CRCPOLY = 0x11021; 
@@ -72,47 +55,42 @@ int main(void) {
         k_sleep(K_MSEC(100));
     }
 
-    printk("\n=== Pico Hardware Signal Detector ===\n");
-    printk("Hunting for Base:0x43434343 Prefix:0x23...\n");
+    printk("\n=== Pico Prefix Scanner (Base 0x43434343) ===\n");
+    printk("Scanning Prefix 0x00 - 0xFF...\n");
 
-    int loop_count = 0;
+    uint16_t current_prefix = 0;
 
     while (1) {
-        uint8_t ch = target_channels[ch_index];
-        radio_config(ch, current_endian);
+        radio_config((uint8_t)current_prefix);
 
-        // 每個頻道聽 100ms
-        for (int i = 0; i < 10; i++) {
+        // 每個 Prefix 聽 50ms
+        // 追蹤器廣播間隔通常 < 20ms，所以 50ms 足夠抓到它
+        for (int i = 0; i < 5; i++) {
             
-            // [關鍵] 硬體地址匹配訊號
+            // [!] 物理地址匹配 [!]
             if (NRF_RADIO->EVENTS_ADDRESS) {
                 NRF_RADIO->EVENTS_ADDRESS = 0;
                 
-                // 只要看到這行，我們就贏了 90%
-                printk("[!!!] PHYSICAL SIGNAL DETECTED on CH %d (Addr 3) [Endian: %s]\n", 
-                       ch, current_endian == ENDIAN_BIG ? "BIG" : "LITTLE");
-            }
-
-            if (NRF_RADIO->EVENTS_END) {
-                NRF_RADIO->EVENTS_END = 0;
+                printk("\n>>> MATCH FOUND! <<<\n");
+                printk("Correct Prefix: 0x%02X\n", (uint8_t)current_prefix);
+                printk("Full Address: 0x%02X + 0x%08X\n", (uint8_t)current_prefix, ADDR_BASE_TARGET);
                 
-                // 如果運氣好 CRC 也過了
-                if (NRF_RADIO->EVENTS_CRCOK) {
-                    printk(">>> PERFECT MATCH! Payload Valid! <<<\n");
+                // 鎖定成功，不再掃描
+                while(1) {
+                    k_busy_wait(100000);
+                    if (NRF_RADIO->EVENTS_ADDRESS) {
+                        NRF_RADIO->EVENTS_ADDRESS = 0;
+                        printk("!"); // 持續閃爍驚嘆號代表訊號穩定
+                    }
                 }
             }
             k_busy_wait(10000); 
         }
 
-        ch_index++;
-        if (ch_index >= 3) {
-            ch_index = 0;
-            // 每掃完一輪頻道，切換一次端序，確保兩種都測到
-            loop_count++;
-            if (loop_count % 2 == 0) {
-                current_endian = (current_endian == ENDIAN_BIG) ? ENDIAN_LITTLE : ENDIAN_BIG;
-                // printk("Switching Endian to: %s\n", current_endian == ENDIAN_BIG ? "BIG" : "LITTLE");
-            }
+        current_prefix++;
+        if (current_prefix > 0xFF) {
+            current_prefix = 0;
+            // printk("."); // 掃完一輪印個點，證明還活著
         }
     }
     return 0;
