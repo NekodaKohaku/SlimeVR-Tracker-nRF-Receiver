@@ -1,6 +1,9 @@
 /*
- * Pico Final Receiver (Scanner Version)
- * Strategy: Rotate between CH 1, 37, 77 rapidly
+ * Pico Final Receiver (Dragnet Version)
+ * Strategy: Listen to ALL logical addresses (0-7) simultaneously.
+ * Base0: 0x552C6A1E (Unique)
+ * Base1: 0x43434343 (Shared/Pairing)
+ * Prefixes: Covers 23, C3, 43, C0, and 04
  */
 
 #include <zephyr/kernel.h>
@@ -9,15 +12,17 @@
 #include <zephyr/usb/usb_device.h>
 #include <zephyr/drivers/uart.h>
 
-#define CRACKED_BASE_ADDR   0x552C6A1E
-#define CRACKED_PREFIX      0xC0
+// === 您的密鑰庫 ===
+#define ADDR_BASE0       0x552C6A1E  // 來自 read32 0x4000151C
+#define ADDR_BASE1       0x43434343  // 來自 read32 0x40001520
+#define ADDR_PREFIX0     0x23C343C0  // 來自 read32 0x40001524
+#define ADDR_PREFIX1     0x04040404  // 猜測值 (來自 Log 的 hint)
 
-// 我們發現的三個跳頻頻道
+// 掃描頻道
 static uint8_t target_channels[] = {1, 37, 77};
 static int ch_index = 0;
 
 void radio_config(uint8_t channel) {
-    // 1. 必須先 Disable 才能改頻率
     NRF_RADIO->TASKS_DISABLE = 1;
     while (NRF_RADIO->EVENTS_DISABLED == 0);
     NRF_RADIO->EVENTS_DISABLED = 0;
@@ -25,31 +30,37 @@ void radio_config(uint8_t channel) {
     nrf_radio_mode_set(NRF_RADIO, NRF_RADIO_MODE_NRF_2MBIT);
     nrf_radio_frequency_set(NRF_RADIO, channel);
 
-    // 地址設定
-    nrf_radio_base0_set(NRF_RADIO, CRACKED_BASE_ADDR);
-    nrf_radio_prefix0_set(NRF_RADIO, CRACKED_PREFIX);
-    nrf_radio_rxaddresses_set(NRF_RADIO, 1); 
+    // --- 關鍵修改：佈下天羅地網 ---
+    
+    // 1. 設定兩組基底
+    nrf_radio_base0_set(NRF_RADIO, ADDR_BASE0); // 給 Address 0 用
+    nrf_radio_base1_set(NRF_RADIO, ADDR_BASE1); // 給 Address 1-7 用
 
-    // 封包格式 (標準)
+    // 2. 設定所有前綴
+    nrf_radio_prefix0_set(NRF_RADIO, ADDR_PREFIX0); // 包含 C0, 43, C3, 23
+    nrf_radio_prefix1_set(NRF_RADIO, ADDR_PREFIX1); // 包含 04, 04, 04, 04
+
+    // 3. 啟用所有邏輯地址 (0-7 全部監聽)
+    nrf_radio_rxaddresses_set(NRF_RADIO, 0xFF); 
+
+    // ----------------------------
+
     NRF_RADIO->PCNF0 = (8 << RADIO_PCNF0_LFLEN_Pos) | (1 << RADIO_PCNF0_S0LEN_Pos);
     NRF_RADIO->PCNF1 = (32 << RADIO_PCNF1_MAXLEN_Pos) | (4 << RADIO_PCNF1_BALEN_Pos) | 
                        (RADIO_PCNF1_ENDIAN_Big << RADIO_PCNF1_ENDIAN_Pos) |
                        (RADIO_PCNF1_WHITEEN_Enabled << RADIO_PCNF1_WHITEEN_Pos);
 
-    // CRC 設定
     nrf_radio_crc_configure(NRF_RADIO, RADIO_CRCCNF_LEN_Two, NRF_RADIO_CRC_ADDR_SKIP, 0x11021);
     NRF_RADIO->CRCINIT = 0xFFFF;
     NRF_RADIO->DATAWHITEIV = channel | 0x40; 
 
     NRF_RADIO->SHORTS = RADIO_SHORTS_READY_START_Msk | RADIO_SHORTS_END_START_Msk;
-    
-    // 啟動接收
     NRF_RADIO->TASKS_RXEN = 1;
 }
 
 int main(void) {
     if (usb_enable(NULL)) return 0;
-
+    
     const struct device *dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_console));
     uint32_t dtr = 0;
     while (!dtr) {
@@ -57,40 +68,35 @@ int main(void) {
         k_sleep(K_MSEC(100));
     }
 
-    printk("\n=== Pico Scanner Active ===\n");
-    printk("Scanning CH 1, 37, 77...\n");
+    printk("\n=== Pico Dragnet Active ===\n");
+    printk("Listening on ALL addresses (Base0/Base1)...\n");
 
     while (1) {
-        // 1. 切換到下一個頻道
         uint8_t ch = target_channels[ch_index];
-        // printk("Scanning CH %d...\n", ch); // 為了不洗版，這行先註解掉
         radio_config(ch);
 
-        // 2. 在這個頻道停留 200ms 聽聽看
-        for (int i = 0; i < 20; i++) {
-            
-            // 如果抓到地址匹配 (Address Match)
+        // 每個頻道聽 150ms
+        for (int i = 0; i < 15; i++) {
             if (NRF_RADIO->EVENTS_ADDRESS) {
                 NRF_RADIO->EVENTS_ADDRESS = 0;
-                printk("[!] Signal on CH %d!\n", ch);
+                // 這次我們不只印 Signal，還印出是「哪一號地址」抓到的
+                // RXMATCH 暫存器會告訴我們是 Address 0~7 哪一個
+                uint8_t match_idx = NRF_RADIO->RXMATCH;
+                printk("[!] Signal on CH %d (Addr Index: %d)!\n", ch, match_idx);
             }
 
-            // 如果接收完成
             if (NRF_RADIO->EVENTS_END) {
                 NRF_RADIO->EVENTS_END = 0;
-                
                 if (NRF_RADIO->EVENTS_CRCOK) {
-                    printk(">>> BINGO! CH %d Packet OK! <<<\n", ch);
+                    printk(">>> BINGO! Packet OK on CH %d! <<<\n", ch);
                 } else if (NRF_RADIO->EVENTS_CRCERROR) {
-                    // 如果有 CRC 錯誤，但地址對了，這代表我們離成功只差一點點
-                    // 可能是端序 (Endian) 或 CRC 初始值的問題
+                    // 如果一直 CRC Error，試試看把 PCNF1 的 Endian 改成 Little
                     printk("--- CRC Error on CH %d ---\n", ch);
                 }
             }
-            k_busy_wait(10000); // Wait 10ms * 20 = 200ms total per channel
+            k_busy_wait(10000); 
         }
 
-        // 3. 換下一個
         ch_index++;
         if (ch_index >= 3) ch_index = 0;
     }
