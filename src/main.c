@@ -1,84 +1,89 @@
 /*
- * Pico Final Receiver (Cracked Version)
- * Decoded Address: Base 0x552C6A1E, Prefix 0xC0
- * Decoded Channel: 1 (2401 MHz)
+ * Pico Final Receiver (Hopping Cracker)
+ * Strategy: Camp on Channel 77 and wait for the tracker.
+ * Address: Base 0x552C6A1E, Prefix 0xC0
  */
 
 #include <zephyr/kernel.h>
 #include <zephyr/sys/printk.h>
 #include <hal/nrf_radio.h>
 
-// 我們剛剛挖出來的密碼
+// === 我們解碼出來的密鑰 ===
 #define CRACKED_BASE_ADDR   0x552C6A1E
 #define CRACKED_PREFIX      0xC0
-#define CRACKED_CHANNEL     1 
+#define CAMPING_CHANNEL     77  // 對應 0x4D (2477 MHz)
 
 void radio_init_sniffer(void) {
-    // 1. 關閉並重置無線電
+    // 1. 關閉無線電
     NRF_RADIO->TASKS_DISABLE = 1;
     while (NRF_RADIO->EVENTS_DISABLED == 0);
     NRF_RADIO->EVENTS_DISABLED = 0;
 
-    // 2. 設定模式 (通常 Pico 是 2Mbit)
+    // 2. 設定模式 (Pico 2.0 通常使用 NRF_2MBIT)
     nrf_radio_mode_set(NRF_RADIO, NRF_RADIO_MODE_NRF_2MBIT);
     
-    // 3. 設定我們挖出來的頻率 (2401 MHz)
-    nrf_radio_frequency_set(NRF_RADIO, CRACKED_CHANNEL);
+    // 3. 設定頻率 (死守 Channel 77)
+    nrf_radio_frequency_set(NRF_RADIO, CAMPING_CHANNEL);
 
-    // 4. 設定我們挖出來的地址
-    // Base Address 0
+    // 4. 設定地址
     nrf_radio_base0_set(NRF_RADIO, CRACKED_BASE_ADDR);
-    // Prefix 0 (取 lowest byte: C0)
     nrf_radio_prefix0_set(NRF_RADIO, CRACKED_PREFIX);
-    
-    // 啟用接收地址 0
-    nrf_radio_rxaddresses_set(NRF_RADIO, 1); 
+    nrf_radio_rxaddresses_set(NRF_RADIO, 1); // 啟用邏輯地址 0
 
-    // 5. 封包設定 (PCNF) - 這是標準 ESB 設定，先試這組
-    // LFLEN=8 bits, S0LEN=1 bit, S1LEN=0
+    // 5. 封包格式 (標準 ESB 配置)
+    // LFLEN=8bit, S0LEN=1bit, S1LEN=0
     NRF_RADIO->PCNF0 = (8 << RADIO_PCNF0_LFLEN_Pos) | 
                        (1 << RADIO_PCNF0_S0LEN_Pos);
                        
-    // MaxLen=32, BalLen=4 (Base Address Length), Endian=Big
+    // MaxLen=32, BalLen=4, Big Endian, Whitening Enabled
     NRF_RADIO->PCNF1 = (32 << RADIO_PCNF1_MAXLEN_Pos) | 
                        (4 << RADIO_PCNF1_BALEN_Pos) | 
                        (RADIO_PCNF1_ENDIAN_Big << RADIO_PCNF1_ENDIAN_Pos) |
                        (RADIO_PCNF1_WHITEEN_Enabled << RADIO_PCNF1_WHITEEN_Pos);
 
-    // 6. CRC 設定 (Pico 通常用 2 bytes CRC)
+    // 6. CRC 設定 (2 Bytes, Algorithm Skip Address)
+    // 這是最常見的標準配置，如果不對我們再試 16-bit CRC
     nrf_radio_crc_configure(NRF_RADIO, RADIO_CRCCNF_LEN_Two, NRF_RADIO_CRC_ADDR_SKIP, 0x11021);
     NRF_RADIO->CRCINIT = 0xFFFF;
-    NRF_RADIO->DATAWHITEIV = CRACKED_CHANNEL | 0x40; // Whitening init (Channel + 40 is unlikely but standard is often channel-based)
+    NRF_RADIO->DATAWHITEIV = CAMPING_CHANNEL | 0x40; // Whitening IV
 
-    // 7. 啟用 Shortcuts (收到後自動重啟接收)
+    // 7. 快捷方式 (收到包後自動重新開始接收)
     NRF_RADIO->SHORTS = RADIO_SHORTS_READY_START_Msk | RADIO_SHORTS_END_START_Msk;
 }
 
 int main(void) {
-    printk("\n=== Pico Tracker Receiver Active ===\n");
-    printk("Listening on Freq: 2401 MHz (CH 1)\n");
-    printk("Address: Base 0x%08X, Prefix 0x%02X\n", CRACKED_BASE_ADDR, CRACKED_PREFIX);
+    printk("\n=== Pico Hunter Active ===\n");
+    printk("Camping on Freq: 2477 MHz (CH %d)\n", CAMPING_CHANNEL);
+    printk("Target Address: 0x%02X + 0x%08X\n", CRACKED_PREFIX, CRACKED_BASE_ADDR);
 
     radio_init_sniffer();
     NRF_RADIO->TASKS_RXEN = 1;
 
     while (1) {
+        // 偵測到「地址匹配」 (抓到訊號了！)
         if (NRF_RADIO->EVENTS_ADDRESS) {
             NRF_RADIO->EVENTS_ADDRESS = 0;
-            printk("[!] Address Match! Signal Detected!\n");
+            printk("[!] Signal Detected! (Address Match)\n");
         }
 
+        // 封包接收結束
         if (NRF_RADIO->EVENTS_END) {
             NRF_RADIO->EVENTS_END = 0;
             
             if (NRF_RADIO->EVENTS_CRCOK) {
-                printk(">>> PACKET RECEIVED! CRC OK! <<<\n");
-                // 這裡可以把封包內容印出來分析 (Payload)
+                printk(">>> BINGO! Packet Received! CRC OK! <<<\n");
+                
+                // 這裡可以把 Payload 印出來看
+                // 例如: printk("Data: %02x %02x ...\n", NRF_RADIO->PACKETPTR...);
+                
             } else if (NRF_RADIO->EVENTS_CRCERROR) {
-                printk("--- CRC Error (But signal is strong) ---\n");
+                printk("--- CRC Error (Frequency mismatch or noise) ---\n");
             }
         }
-        k_busy_wait(100);
+        
+        // 避免 CPU 跑太快刷屏，這裡稍微停一下
+        // 但 Radio 依然在背景接收
+        k_busy_wait(100); 
     }
     return 0;
 }
