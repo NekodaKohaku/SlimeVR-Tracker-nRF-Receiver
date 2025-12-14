@@ -1,7 +1,7 @@
 /*
- * Pico Frequency Sweeper
- * Target: Address 0x23 (1-Byte)
- * Action: Sweep ALL channels (0-80) to find where it is hiding.
+ * Pico Energy Scanner (RSSI)
+ * 不管地址，不管內容，只看「能量」。
+ * 用來確認硬體通訊層是否建立。
  */
 
 #include <zephyr/kernel.h>
@@ -10,39 +10,21 @@
 #include <zephyr/usb/usb_device.h>
 #include <zephyr/drivers/uart.h>
 
-// 我們最懷疑的地址 (來自 Dump Prefix byte 3)
-#define TARGET_PREFIX  0x23
+// 我們鎖定的三個嫌疑頻道
+static uint8_t target_channels[] = {1, 37, 77};
+static int ch_index = 0;
 
-void radio_config(uint8_t channel) {
+void radio_init(uint8_t channel) {
     NRF_RADIO->TASKS_DISABLE = 1;
     while (NRF_RADIO->EVENTS_DISABLED == 0);
     NRF_RADIO->EVENTS_DISABLED = 0;
-
-    // 設定模式 2Mbit
+    
     nrf_radio_mode_set(NRF_RADIO, NRF_RADIO_MODE_NRF_2MBIT);
     nrf_radio_frequency_set(NRF_RADIO, channel);
-
-    // 設定地址: 1-Byte Mode (BALEN=0)
-    // 我們只看 Prefix
-    nrf_radio_prefix0_set(NRF_RADIO, TARGET_PREFIX); 
-    nrf_radio_rxaddresses_set(NRF_RADIO, 1); 
-
-    // PCNF0: S1LEN=4 (根據 Dump)
-    NRF_RADIO->PCNF0 = (8 << RADIO_PCNF0_LFLEN_Pos) | (4 << RADIO_PCNF0_S1LEN_Pos);
-
-    // PCNF1: BALEN=0, Little Endian, No Whitening (根據 0x04 推算)
-    NRF_RADIO->PCNF1 = (32 << RADIO_PCNF1_MAXLEN_Pos) | 
-                       (0 << RADIO_PCNF1_BALEN_Pos) | // BALEN=0
-                       (RADIO_PCNF1_ENDIAN_Little << RADIO_PCNF1_ENDIAN_Pos) |
-                       (RADIO_PCNF1_WHITEEN_Disabled << RADIO_PCNF1_WHITEEN_Pos);
-
-    // CRC: 我們先假設標準 2 bytes
-    NRF_RADIO->CRCCNF = (RADIO_CRCCNF_LEN_Two << RADIO_CRCCNF_LEN_Pos) |
-                        (RADIO_CRCCNF_SKIPADDR_Include << RADIO_CRCCNF_SKIPADDR_Pos);
-    NRF_RADIO->CRCPOLY = 0x11021; 
-    NRF_RADIO->CRCINIT = 0xFFFF;
-
-    NRF_RADIO->SHORTS = RADIO_SHORTS_READY_START_Msk | RADIO_SHORTS_END_START_Msk;
+    
+    // 隨便設個地址，反正我們不靠地址觸發，我們靠 RSSI
+    // 啟用接收
+    NRF_RADIO->SHORTS = RADIO_SHORTS_READY_START_Msk;
     NRF_RADIO->TASKS_RXEN = 1;
 }
 
@@ -55,44 +37,43 @@ int main(void) {
         uart_line_ctrl_get(dev, UART_LINE_CTRL_DTR, &dtr);
         k_sleep(K_MSEC(100));
     }
-
-    printk("\n=== Pico Frequency Sweeper ===\n");
-    printk("Hunting Address 0x%02X across CH 0-80...\n", TARGET_PREFIX);
-
-    int current_freq = 0;
+    
+    printk("\n=== Pico Energy/RSSI Scanner ===\n");
+    printk("Looking for pulses on CH 1, 37, 77...\n");
 
     while (1) {
-        radio_config(current_freq);
-
-        // 每個頻道聽 30ms
-        for (int i = 0; i < 3; i++) {
+        uint8_t ch = target_channels[ch_index];
+        radio_init(ch);
+        
+        // 在每個頻道聽 200ms
+        int high_energy_count = 0;
+        
+        for(int i=0; i<200; i++) {
+            // 啟動 RSSI 測量
+            NRF_RADIO->TASKS_RSSISTART = 1;
+            k_busy_wait(50); // 等待採樣
             
-            // [!] 物理地址匹配 [!]
-            // 只要硬體偵測到 0x23，我們就認定抓到頻道了
-            if (NRF_RADIO->EVENTS_ADDRESS) {
-                NRF_RADIO->EVENTS_ADDRESS = 0;
+            if (NRF_RADIO->EVENTS_RSSIEND) {
+                NRF_RADIO->EVENTS_RSSIEND = 0;
+                uint8_t rssi_val = NRF_RADIO->RSSI; // 絕對值，越小越強
                 
-                printk("\n>>> CONTACT! CH %d <<<\n", current_freq);
-                printk("Signal detected on Freq: %d MHz\n", 2400 + current_freq);
-                
-                // 檢查 CRC
-                if (NRF_RADIO->EVENTS_END && NRF_RADIO->EVENTS_CRCOK) {
-                     printk("Payload Verified (CRC OK)!\n");
-                     // 鎖定這個頻道
-                     while(1) {
-                         k_busy_wait(100000);
-                         if(NRF_RADIO->EVENTS_CRCOK) {
-                             NRF_RADIO->EVENTS_CRCOK=0; 
-                             printk(".");
-                         }
-                     }
+                // 門檻：通常背景雜訊約 90-100dBm
+                // 如果 < 60dBm，代表有很強的訊號在附近
+                if (rssi_val < 60) {
+                    high_energy_count++;
                 }
             }
-            k_busy_wait(10000); 
+            k_busy_wait(1000); // 1ms
+        }
+        
+        // 如果這個頻道偵測到多次能量脈衝
+        if (high_energy_count > 5) {
+            printk("[!!!] High Energy Detected on CH %d (Count: %d) [!!!]\n", ch, high_energy_count);
+        } else {
+             // printk("CH %d: Quiet\n", ch); // 安靜時不印，避免洗頻
         }
 
-        current_freq++;
-        if (current_freq > 85) current_freq = 0; // 掃描 2400-2485 MHz
+        ch_index++;
+        if (ch_index >= 3) ch_index = 0;
     }
-    return 0;
 }
