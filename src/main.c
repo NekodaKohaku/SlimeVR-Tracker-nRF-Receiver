@@ -1,7 +1,7 @@
 /*
- * Pico Tri-Channel Proximity Scanner
- * Strategy: Scan Ch 1, 37, 77 for 1-byte addresses.
- * Filter: Accept signals stronger than -75dBm (Close range).
+ * Pico Sniper Ch37 (Noise Immune)
+ * Strategy: Ignore Ch 1/77. Lock onto Ch 37.
+ * Dwell time: Increased to 100ms per prefix to catch the blink.
  */
 
 #include <zephyr/kernel.h>
@@ -10,35 +10,35 @@
 #include <zephyr/usb/usb_device.h>
 #include <zephyr/drivers/uart.h>
 
-// 掃描這三個 "配對常用頻道"
-static uint8_t target_channels[] = {1, 37, 77};
-static int ch_index = 0;
+// 根據 Halt 結果，目標絕對在這裡
+#define TARGET_FREQ 37 
 
-// 放寬 RSSI 門檻：-75dBm
-// 數值 < 75 才會顯示 (例如 40, 50, 60...)
-#define RSSI_THRESHOLD 75 
+// 雜訊過濾：只有強於 -70dBm 的才算
+// 追蹤器貼近時通常是 -30 到 -50
+#define RSSI_THRESHOLD 70 
 
-void radio_config(uint8_t channel, uint8_t prefix) {
+void radio_config(uint8_t prefix) {
     NRF_RADIO->TASKS_DISABLE = 1;
     while (NRF_RADIO->EVENTS_DISABLED == 0);
     NRF_RADIO->EVENTS_DISABLED = 0;
 
     nrf_radio_mode_set(NRF_RADIO, NRF_RADIO_MODE_NRF_2MBIT);
-    nrf_radio_frequency_set(NRF_RADIO, channel);
+    nrf_radio_frequency_set(NRF_RADIO, TARGET_FREQ);
 
     // 1-Byte Address (BALEN=0)
     nrf_radio_prefix0_set(NRF_RADIO, prefix); 
     nrf_radio_rxaddresses_set(NRF_RADIO, 1); 
 
-    // PCNF0: S1LEN=4 (標準)
+    // PCNF0: S1LEN=4 (Based on Halt dump)
     NRF_RADIO->PCNF0 = (8 << RADIO_PCNF0_LFLEN_Pos) | (4 << RADIO_PCNF0_S1LEN_Pos);
 
-    // PCNF1: BALEN=0 (1-Byte Mode)
+    // PCNF1: BALEN=0, Little Endian
     NRF_RADIO->PCNF1 = (32 << RADIO_PCNF1_MAXLEN_Pos) | 
                        (0 << RADIO_PCNF1_BALEN_Pos) | 
                        (RADIO_PCNF1_ENDIAN_Little << RADIO_PCNF1_ENDIAN_Pos) |
                        (RADIO_PCNF1_WHITEEN_Disabled << RADIO_PCNF1_WHITEEN_Pos);
 
+    // CRC
     NRF_RADIO->CRCCNF = (RADIO_CRCCNF_LEN_Two << RADIO_CRCCNF_LEN_Pos) |
                         (RADIO_CRCCNF_SKIPADDR_Include << RADIO_CRCCNF_SKIPADDR_Pos);
     NRF_RADIO->CRCPOLY = 0x11021; 
@@ -58,46 +58,50 @@ int main(void) {
         k_sleep(K_MSEC(100));
     }
 
-    printk("\n=== Pico Tri-Channel Scanner ===\n");
-    printk("Scanning CH 1, 37, 77. Filter: > -%d dBm\n", RSSI_THRESHOLD);
+    printk("\n=== Pico Sniper (CH 37 Only) ===\n");
+    printk("Frequency: 2437 MHz. Filter: > -%d dBm\n", RSSI_THRESHOLD);
+    printk("Scanning Prefixes... Please keep Tracker flashing!\n");
 
     uint16_t current_prefix = 0;
 
     while (1) {
-        // 切換頻道
-        uint8_t ch = target_channels[ch_index];
-        radio_config(ch, (uint8_t)current_prefix);
+        radio_config((uint8_t)current_prefix);
 
-        // 每個頻道的每個地址聽 15ms (快速掃描)
-        for (int i = 0; i < 2; i++) {
+        // 延長監聽時間：每個地址聽 100ms
+        // 這樣掃完一輪 00-FF 需要約 25 秒
+        // 優點：絕對不會錯過閃爍
+        // 缺點：您需要讓它閃久一點
+        for (int i = 0; i < 10; i++) {
             
             if (NRF_RADIO->EVENTS_ADDRESS) {
                 NRF_RADIO->EVENTS_ADDRESS = 0;
                 
-                // 立即測量訊號強度
+                // 測量強度
                 NRF_RADIO->TASKS_RSSISTART = 1;
                 while(!NRF_RADIO->EVENTS_RSSIEND);
                 NRF_RADIO->EVENTS_RSSIEND = 0;
                 
                 uint8_t rssi = NRF_RADIO->RSSISAMPLE;
 
-                // 只有訊號夠強才印出來
+                // 強訊號過濾 (數值越小越強，例如 30 比 80 強)
                 if (rssi < RSSI_THRESHOLD) {
-                    printk("\n>>> HIT! CH %d | Prefix: 0x%02X (RSSI: -%d) <<<\n", ch, (uint8_t)current_prefix, rssi);
-                    // 稍微暫停讓我們看清楚
-                    k_busy_wait(50000); 
+                    printk("\n>>> HIT! Prefix: 0x%02X (RSSI: -%d) <<<\n", (uint8_t)current_prefix, rssi);
+                    
+                    // 如果 CRC 也過了，那就是 100% 中獎
+                    if (NRF_RADIO->EVENTS_CRCOK) {
+                        printk("!!! CRC OK !!! This is definitely it.\n");
+                        // 鎖定
+                        while(1) k_sleep(K_FOREVER);
+                    }
                 }
             }
-            k_busy_wait(8000); 
+            k_busy_wait(10000); 
         }
 
-        // 邏輯：先掃完一個地址的所有頻道，再換下一個地址
-        // 這樣比較容易捕捉到那個瞬間
-        ch_index++;
-        if (ch_index >= 3) {
-            ch_index = 0;
-            current_prefix++; // 換下一個地址
-            if (current_prefix > 0xFF) current_prefix = 0;
+        current_prefix++;
+        if (current_prefix > 0xFF) {
+            current_prefix = 0;
+            printk("."); // 每掃完一輪印一個點，讓您知道它還活著
         }
     }
 }
