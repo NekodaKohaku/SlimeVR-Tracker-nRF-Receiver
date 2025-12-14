@@ -1,7 +1,8 @@
 /*
- * Pico Final Cracker (Ch 37 Locked)
- * Target: Crack the 1-byte address on Channel 37.
- * Config: BALEN=0, Fixed Freq 2437MHz.
+ * Pico Proximity Cracker (RSSI Filtered)
+ * Target: Scan 1-byte address on Ch 37.
+ * Filter: ONLY accept signals stronger than -50dBm (Very Close).
+ * This eliminates Wi-Fi noise.
  */
 
 #include <zephyr/kernel.h>
@@ -10,37 +11,33 @@
 #include <zephyr/usb/usb_device.h>
 #include <zephyr/drivers/uart.h>
 
-// 鎖定 Halt 抓到的頻道
 #define TARGET_FREQ 37 
+// RSSI 門檻：數值越小訊號越強。
+// 50 代表 -50dBm。如果數值 < 50 (例如 30)，代表非常近。
+// Wi-Fi 雜訊通常在 70-90 之間。
+#define RSSI_THRESHOLD 50 
 
 void radio_config(uint8_t prefix) {
     NRF_RADIO->TASKS_DISABLE = 1;
     while (NRF_RADIO->EVENTS_DISABLED == 0);
     NRF_RADIO->EVENTS_DISABLED = 0;
 
-    // 1. 設定模式 2Mbit
     nrf_radio_mode_set(NRF_RADIO, NRF_RADIO_MODE_NRF_2MBIT);
-    
-    // 2. 鎖定頻率 2437 MHz (0x25)
     nrf_radio_frequency_set(NRF_RADIO, TARGET_FREQ);
 
-    // 3. 設定 1-Byte 地址 (BALEN=0)
-    // 我們只修改 Prefix0，Base0 不會被使用
+    // 1-Byte Address (BALEN=0)
     nrf_radio_prefix0_set(NRF_RADIO, prefix); 
     nrf_radio_rxaddresses_set(NRF_RADIO, 1); 
 
-    // 4. PCNF0 (根據 Halt 讀到的 0x00040008)
-    // LFLEN=8, S0LEN=0, S1LEN=4
+    // PCNF0: S1LEN=4 (Based on Halt dump)
     NRF_RADIO->PCNF0 = (8 << RADIO_PCNF0_LFLEN_Pos) | (4 << RADIO_PCNF0_S1LEN_Pos);
 
-    // 5. PCNF1 (根據 Halt 讀到的 0x00000004)
-    // BALEN=0 (關鍵!), Little Endian, No Whitening
+    // PCNF1: BALEN=0
     NRF_RADIO->PCNF1 = (32 << RADIO_PCNF1_MAXLEN_Pos) | 
                        (0 << RADIO_PCNF1_BALEN_Pos) | 
                        (RADIO_PCNF1_ENDIAN_Little << RADIO_PCNF1_ENDIAN_Pos) |
                        (RADIO_PCNF1_WHITEEN_Disabled << RADIO_PCNF1_WHITEEN_Pos);
 
-    // 6. CRC (我們雖然設定，但稍後會忽略錯誤)
     NRF_RADIO->CRCCNF = (RADIO_CRCCNF_LEN_Two << RADIO_CRCCNF_LEN_Pos) |
                         (RADIO_CRCCNF_SKIPADDR_Include << RADIO_CRCCNF_SKIPADDR_Pos);
     NRF_RADIO->CRCPOLY = 0x11021; 
@@ -60,45 +57,50 @@ int main(void) {
         k_sleep(K_MSEC(100));
     }
 
-    printk("\n=== Pico Ch37 Cracker ===\n");
-    printk("Locking on 2437MHz, Scanning Prefixes 00-FF...\n");
+    printk("\n=== Pico Proximity Cracker ===\n");
+    printk("Scanning Prefixes 00-FF on CH 37.\n");
+    printk("NOTE: Place Tracker VERY CLOSE to Dongle!\n");
+    printk("Ignoring weak signals (Noise > -%d dBm)...\n", RSSI_THRESHOLD);
 
     uint16_t current_prefix = 0;
 
     while (1) {
         radio_config((uint8_t)current_prefix);
 
-        // 每個 Prefix 聽 30ms
-        // 這樣掃完一輪 256 個地址大約需要 7.6 秒
-        // 請務必讓追蹤器持續閃爍超過 10 秒
+        // 每個 Prefix 聽 25ms (快速掃描)
         for (int i = 0; i < 3; i++) {
             
-            // 只要地址匹配 (EVENTS_ADDRESS)，我們就印出來！
-            // 不管 CRC 對不對，先抓到再說！
+            // 1. 等待地址匹配 (這會因為雜訊一直觸發)
             if (NRF_RADIO->EVENTS_ADDRESS) {
                 NRF_RADIO->EVENTS_ADDRESS = 0;
                 
-                printk("\n>>> ADDR MATCH! Prefix: 0x%02X <<<\n", (uint8_t)current_prefix);
+                // 2. [關鍵] 馬上測量訊號強度！
+                NRF_RADIO->TASKS_RSSISTART = 1;
                 
-                // 等待封包接收完成，檢查 CRC
-                while(!NRF_RADIO->EVENTS_END); 
-                NRF_RADIO->EVENTS_END = 0;
+                // 等待測量完成 (硬體只需幾微秒)
+                while(!NRF_RADIO->EVENTS_RSSIEND);
+                NRF_RADIO->EVENTS_RSSIEND = 0;
+                
+                uint8_t rssi = NRF_RADIO->RSSISAMPLE;
 
-                if (NRF_RADIO->EVENTS_CRCOK) {
-                    printk("!!! CRC OK - PERFECT MATCH !!!\n");
-                    // 鎖定成功
-                    while(1) k_sleep(K_FOREVER);
-                } else {
-                    printk("(CRC Fail but Addr Match - Likely Candidate)\n");
+                // 3. 過濾雜訊
+                // 只有當訊號超強 (RSSI < 50) 時，我們才認為這是追蹤器
+                if (rssi < RSSI_THRESHOLD) {
+                    printk("\n>>> STRONG SIGNAL MATCH! <<<\n");
+                    printk("Prefix: 0x%02X (RSSI: -%d dBm)\n", (uint8_t)current_prefix, rssi);
+                    
+                    // 再次確認：如果是雜訊，CRC 通常會錯。如果是追蹤器，CRC 可能會對。
+                    // 這裡我們不鎖定，讓它繼續掃描，看哪個 Prefix 出現最多次
+                    k_busy_wait(50000); 
                 }
             }
-            k_busy_wait(10000); // 10ms
+            k_busy_wait(8000); 
         }
 
         current_prefix++;
         if (current_prefix > 0xFF) {
             current_prefix = 0;
-            // printk("."); // 掃完一輪印個點
+            // 掃完一輪不印點，保持介面乾淨
         }
     }
 }
