@@ -1,9 +1,10 @@
 /*
- * Pico Final Receiver (Dragnet Version)
- * Strategy: Listen to ALL logical addresses (0-7) simultaneously.
- * Base0: 0x552C6A1E (Unique)
- * Base1: 0x43434343 (Shared/Pairing)
- * Prefixes: Covers 23, C3, 43, C0, and 04
+ * Pico Receiver: THE CRACKED VERSION
+ * Configured based on actual register dumps.
+ * Mode: 2Mbit (Assumed standard)
+ * Endian: Little (Crucial fix!)
+ * Whitening: OFF (Crucial fix!)
+ * CRC: 2 Bytes, Includes Address
  */
 
 #include <zephyr/kernel.h>
@@ -12,11 +13,13 @@
 #include <zephyr/usb/usb_device.h>
 #include <zephyr/drivers/uart.h>
 
-// === 您的密鑰庫 ===
-#define ADDR_BASE0       0x552C6A1E  // 來自 read32 0x4000151C
-#define ADDR_BASE1       0x43434343  // 來自 read32 0x40001520
-#define ADDR_PREFIX0     0x23C343C0  // 來自 read32 0x40001524
-#define ADDR_PREFIX1     0x04040404  // 猜測值 (來自 Log 的 hint)
+// === 地址設定 ===
+// 根據您的 read32 0x40001520 (Base1) 和 0x40001518 (TXADDR)
+// 它是用 Logical Address 3 發射的
+// Base1: 0x43434343
+// Prefix3: 0x23 (來自 Prefix0 的最高字節)
+#define ADDR_BASE1       0x43434343 
+#define ADDR_PREFIX0     0x23C343C0  // 包含 C0, 43, C3, 23 (我們全聽)
 
 // 掃描頻道
 static uint8_t target_channels[] = {1, 37, 77};
@@ -27,32 +30,36 @@ void radio_config(uint8_t channel) {
     while (NRF_RADIO->EVENTS_DISABLED == 0);
     NRF_RADIO->EVENTS_DISABLED = 0;
 
+    // 1. 設定模式 (標準 VR 都是 2Mbit)
     nrf_radio_mode_set(NRF_RADIO, NRF_RADIO_MODE_NRF_2MBIT);
     nrf_radio_frequency_set(NRF_RADIO, channel);
 
-    // --- 關鍵修改：佈下天羅地網 ---
-    
-    // 1. 設定兩組基底
-    nrf_radio_base0_set(NRF_RADIO, ADDR_BASE0); // 給 Address 0 用
-    nrf_radio_base1_set(NRF_RADIO, ADDR_BASE1); // 給 Address 1-7 用
+    // 2. 設定地址 (還是使用天羅地網，但重點是 Endian 改了)
+    nrf_radio_base1_set(NRF_RADIO, ADDR_BASE1); 
+    nrf_radio_prefix0_set(NRF_RADIO, ADDR_PREFIX0); 
+    // 監聽 Address 0-3 (0x0F)
+    nrf_radio_rxaddresses_set(NRF_RADIO, 0x0F); 
 
-    // 2. 設定所有前綴
-    nrf_radio_prefix0_set(NRF_RADIO, ADDR_PREFIX0); // 包含 C0, 43, C3, 23
-    nrf_radio_prefix1_set(NRF_RADIO, ADDR_PREFIX1); // 包含 04, 04, 04, 04
+    // 3. PCNF0 (根據 read32 0x40001514 = 00040008)
+    // LFLEN=8, S0LEN=0, S1LEN=4 (關鍵差異!)
+    NRF_RADIO->PCNF0 = (8 << RADIO_PCNF0_LFLEN_Pos) | 
+                       (0 << RADIO_PCNF0_S0LEN_Pos) |
+                       (4 << RADIO_PCNF0_S1LEN_Pos); // 修正這裡！
 
-    // 3. 啟用所有邏輯地址 (0-7 全部監聽)
-    nrf_radio_rxaddresses_set(NRF_RADIO, 0xFF); 
+    // 4. PCNF1 (根據 read32 0x40001510 = 00000004)
+    // Little Endian, No Whitening, MaxLen=32(safe default), BalLen=4(standard)
+    NRF_RADIO->PCNF1 = (32 << RADIO_PCNF1_MAXLEN_Pos) | 
+                       (4 << RADIO_PCNF1_BALEN_Pos) | 
+                       (RADIO_PCNF1_ENDIAN_Little << RADIO_PCNF1_ENDIAN_Pos) | // 修正：小端序
+                       (RADIO_PCNF1_WHITEEN_Disabled << RADIO_PCNF1_WHITEEN_Pos); // 修正：關閉白化
 
-    // ----------------------------
-
-    NRF_RADIO->PCNF0 = (8 << RADIO_PCNF0_LFLEN_Pos) | (1 << RADIO_PCNF0_S0LEN_Pos);
-    NRF_RADIO->PCNF1 = (32 << RADIO_PCNF1_MAXLEN_Pos) | (4 << RADIO_PCNF1_BALEN_Pos) | 
-                       (RADIO_PCNF1_ENDIAN_Big << RADIO_PCNF1_ENDIAN_Pos) |
-                       (RADIO_PCNF1_WHITEEN_Enabled << RADIO_PCNF1_WHITEEN_Pos);
-
-    nrf_radio_crc_configure(NRF_RADIO, RADIO_CRCCNF_LEN_Two, NRF_RADIO_CRC_ADDR_SKIP, 0x11021);
-    NRF_RADIO->CRCINIT = 0xFFFF;
-    NRF_RADIO->DATAWHITEIV = channel | 0x40; 
+    // 5. CRC 設定 (根據 read32 0x40001534 = 2)
+    // 2 Bytes, Include Address (SKIPADDR=0)
+    // Poly 0x11021 (from 0x1538)
+    NRF_RADIO->CRCCNF = (RADIO_CRCCNF_LEN_Two << RADIO_CRCCNF_LEN_Pos) |
+                        (RADIO_CRCCNF_SKIPADDR_Include << RADIO_CRCCNF_SKIPADDR_Pos); // 修正：包含地址
+    NRF_RADIO->CRCPOLY = 0x11021; 
+    NRF_RADIO->CRCINIT = 0xFFFF; // 通常是 FFFF，先試這個
 
     NRF_RADIO->SHORTS = RADIO_SHORTS_READY_START_Msk | RADIO_SHORTS_END_START_Msk;
     NRF_RADIO->TASKS_RXEN = 1;
@@ -68,29 +75,27 @@ int main(void) {
         k_sleep(K_MSEC(100));
     }
 
-    printk("\n=== Pico Dragnet Active ===\n");
-    printk("Listening on ALL addresses (Base0/Base1)...\n");
+    printk("\n=== Pico Corrected Config ===\n");
+    printk("Config: Little Endian, No Whitening, S1=4\n");
 
     while (1) {
         uint8_t ch = target_channels[ch_index];
         radio_config(ch);
 
-        // 每個頻道聽 150ms
-        for (int i = 0; i < 15; i++) {
+        // 每個頻道掃描 100ms
+        for (int i = 0; i < 10; i++) {
             if (NRF_RADIO->EVENTS_ADDRESS) {
                 NRF_RADIO->EVENTS_ADDRESS = 0;
-                // 這次我們不只印 Signal，還印出是「哪一號地址」抓到的
-                // RXMATCH 暫存器會告訴我們是 Address 0~7 哪一個
-                uint8_t match_idx = NRF_RADIO->RXMATCH;
-                printk("[!] Signal on CH %d (Addr Index: %d)!\n", ch, match_idx);
+                // 印出是抓到哪一號地址 (應該是 3)
+                printk("[!] Signal on CH %d (Addr: %d)\n", ch, NRF_RADIO->RXMATCH);
             }
 
             if (NRF_RADIO->EVENTS_END) {
                 NRF_RADIO->EVENTS_END = 0;
+                
                 if (NRF_RADIO->EVENTS_CRCOK) {
-                    printk(">>> BINGO! Packet OK on CH %d! <<<\n", ch);
+                    printk(">>> PACKET OK! CH %d <<<\n", ch);
                 } else if (NRF_RADIO->EVENTS_CRCERROR) {
-                    // 如果一直 CRC Error，試試看把 PCNF1 的 Endian 改成 Little
                     printk("--- CRC Error on CH %d ---\n", ch);
                 }
             }
