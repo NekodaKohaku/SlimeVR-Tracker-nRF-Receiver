@@ -1,8 +1,7 @@
 /*
  * Copyright (c) 2025 White Cat DIY
- * Pico Tracker Waker - "The Alarm Clock"
- * Target Address: 0xC0552C6A1E
- * Payload: 0x00 0x01 (Wake Up / Keep-Alive)
+ * Pico Tracker Transceiver - "The Interrogator"
+ * Action: Send WakeUp -> Switch to RX -> Listen for Status
  */
 
 #include <zephyr/kernel.h>
@@ -13,53 +12,53 @@
 
 #define CONSOLE_DEVICE_LABEL DT_CHOSEN(zephyr_console)
 
-// 🔑 目標地址 (逆向搜出的)
+// 🔑 目標地址
 #define TARGET_BASE_ADDR  0x552c6a1eUL
 #define TARGET_PREFIX     0xC0
 
-// 📡 攻擊頻率表 (根據之前的觀測)
-// 我們輪流在這幾個頻率發射，確保 Tracker 跳到哪都能聽到
-static const int target_channels[] = {1, 37, 77, 40}; 
+// 📡 頻率表
+static const int channels[] = {1, 37, 77, 40};
 #define CH_COUNT 4
 
-// 📦 封包緩衝區
-static uint8_t tx_packet[32];
+static uint8_t packet_buffer[32]; // 用於發送和接收
 
-void radio_tx_setup(int channel)
+// 設定 Radio 基本參數 (共用)
+void radio_common_setup(int channel)
 {
-    // 1. 先停用 Radio
     NRF_RADIO->TASKS_DISABLE = 1;
     while (NRF_RADIO->EVENTS_DISABLED == 0);
     NRF_RADIO->EVENTS_DISABLED = 0;
 
-    // 2. 設定頻率
     NRF_RADIO->FREQUENCY = channel;
-    
-    // 3. 設定 2Mbit ESB 模式 (私有協議)
     NRF_RADIO->MODE = RADIO_MODE_MODE_Nrf_2Mbit; 
-
-    // 4. 設定地址 (The Golden Key)
+    
     NRF_RADIO->BASE0 = TARGET_BASE_ADDR;
     NRF_RADIO->PREFIX0 = TARGET_PREFIX;
-    NRF_RADIO->TXADDRESS = 0; // 使用 Logical Address 0 發射
-    NRF_RADIO->RXADDRESSES = 1;
-
-    // 5. 設定封包格式 (標準 ESB, 無 Dynamic Payload Length)
-    NRF_RADIO->PCNF0 = 0;
     
-    // MaxLen=32, Balen=4, Little Endian, No Whitening
-    NRF_RADIO->PCNF1 = (32 << RADIO_PCNF1_MAXLEN_Pos) | 
-                       (4 << RADIO_PCNF1_BALEN_Pos) | 
-                       (RADIO_PCNF1_ENDIAN_Little << RADIO_PCNF1_ENDIAN_Pos) |
-                       (0 << RADIO_PCNF1_WHITEEN_Pos); 
-
-    // 6. 設定 CRC (非常重要！CRC 錯了 Tracker 會直接拒收)
-    // 根據逆向結果：CRC-16-CCITT
+    // 設定 CRC (接收時必須 CRC 正確才收)
     NRF_RADIO->CRCCNF = (RADIO_CRCCNF_LEN_Two << RADIO_CRCCNF_LEN_Pos); 
     NRF_RADIO->CRCINIT = 0xFFFF;      
-    NRF_RADIO->CRCPOLY = 0x11021;      
+    NRF_RADIO->CRCPOLY = 0x11021; 
     
     NRF_RADIO->SHORTS = 0;
+}
+
+// 設定為發射模式
+void setup_tx_mode(void) {
+    NRF_RADIO->TXADDRESS = 0; 
+    NRF_RADIO->RXADDRESSES = 0; // TX 時不收
+
+    NRF_RADIO->PCNF0 = 0;
+    NRF_RADIO->PCNF1 = (32 << RADIO_PCNF1_MAXLEN_Pos) | (4 << RADIO_PCNF1_BALEN_Pos) | (RADIO_PCNF1_ENDIAN_Little << RADIO_PCNF1_ENDIAN_Pos);
+}
+
+// 設定為接收模式
+void setup_rx_mode(void) {
+    NRF_RADIO->TXADDRESS = 0; 
+    NRF_RADIO->RXADDRESSES = 1; // 啟用 Logical Address 0 接收
+
+    NRF_RADIO->PCNF0 = 0;
+    NRF_RADIO->PCNF1 = (32 << RADIO_PCNF1_MAXLEN_Pos) | (4 << RADIO_PCNF1_BALEN_Pos) | (RADIO_PCNF1_ENDIAN_Little << RADIO_PCNF1_ENDIAN_Pos);
 }
 
 int main(void)
@@ -68,52 +67,99 @@ int main(void)
     uint32_t dtr = 0;
 
     usb_enable(NULL);
-    
-    // 如果你想看 Log，可以取消下面註解等待 Serial 連接
-    // while (!dtr) {
-    //     uart_line_ctrl_get(console_dev, UART_LINE_CTRL_DTR, &dtr);
-    //     k_sleep(K_MSEC(100));
-    // }
+    // while (!dtr) { uart_line_ctrl_get(console_dev, UART_LINE_CTRL_DTR, &dtr); k_sleep(K_MSEC(100)); }
 
-    printk("\n>>> ALARM CLOCK STARTED: Waking up 0xC0552C6A1E <<<\n");
-
-    // 🛠️ 準備喚醒指令 (根據 Ghidra 逆向結果)
-    // 邏輯：讀取 buffer[1] 的 bit 0
-    tx_packet[0] = 0x00; // Byte 0 (忽略或類型)
-    tx_packet[1] = 0x01; // Byte 1 (Bit 0 = 1 -> Wake Up!) <--- 關鍵指令
-    tx_packet[2] = 0x00;
-    // ... 後面全部補零
-    for(int i=3; i<32; i++) tx_packet[i] = 0x00;
-
-    NRF_RADIO->PACKETPTR = (uint32_t)tx_packet;
+    printk("\n>>> INTERROGATOR STARTED: Sending 00 01 and Listening... <<<\n");
 
     int ch_idx = 0;
 
     while (1) {
-        // A. 設定當前頻率
-        radio_tx_setup(target_channels[ch_idx]);
+        int current_freq = channels[ch_idx];
 
-        // B. 啟動發射器 (TX Enable)
+        // ============================
+        // 1. 發射喚醒指令 (Ping)
+        // ============================
+        radio_common_setup(current_freq);
+        setup_tx_mode();
+
+        // 準備 Payload: 00 01 (Wake Up)
+        packet_buffer[0] = 0x00;
+        packet_buffer[1] = 0x01; // Bit 0 = 1
+        // 清空後面
+        for(int i=2; i<32; i++) packet_buffer[i] = 0x00;
+        
+        NRF_RADIO->PACKETPTR = (uint32_t)packet_buffer;
+
+        // Fire!
         NRF_RADIO->EVENTS_READY = 0;
         NRF_RADIO->TASKS_TXEN = 1;
         while(NRF_RADIO->EVENTS_READY == 0);
-
-        // C. 發射封包！ (Fire!)
+        
         NRF_RADIO->EVENTS_END = 0;
         NRF_RADIO->TASKS_START = 1;
         while(NRF_RADIO->EVENTS_END == 0);
-
-        // D. 關閉無線電 (必須先關閉才能換頻率)
+        
+        // 發射完立刻關閉，準備切換 RX
         NRF_RADIO->TASKS_DISABLE = 1;
-        
-        // printk("Ping sent to Ch:%d\n", target_channels[ch_idx]);
+        while(NRF_RADIO->EVENTS_DISABLED == 0);
 
-        // E. 快速切換下一個頻率
-        // 我們要製造「彈幕」，讓 Tracker 無論跳到哪個頻道都能被打中
-        // 5ms 切換一次
-        k_busy_wait(5000); 
+
+        // ============================
+        // 2. 切換到接收模式 (Pong?)
+        // ============================
+        // 保持在同一個頻率聽，因為 ACK 或回傳通常在同頻率
+        // 我們不重新 configure common，直接設 RX
+        setup_rx_mode();
         
+        // 清空 Buffer 以便觀察接收到的新數據
+        for(int i=0; i<32; i++) packet_buffer[i] = 0xCC; // 填入 0xCC 方便識別
+        NRF_RADIO->PACKETPTR = (uint32_t)packet_buffer;
+
+        NRF_RADIO->EVENTS_READY = 0;
+        NRF_RADIO->TASKS_RXEN = 1;
+        while(NRF_RADIO->EVENTS_READY == 0);
+        
+        NRF_RADIO->EVENTS_END = 0;
+        NRF_RADIO->TASKS_START = 1;
+
+        // 監聽窗口：10ms
+        // 如果是 ACK Payload，其實在前幾百微秒就會進來
+        // 如果是獨立封包，可能會慢一點
+        int timeout = 10000; 
+        int received = 0;
+        
+        while(timeout > 0) {
+            if (NRF_RADIO->EVENTS_END) {
+                received = 1;
+                break;
+            }
+            k_busy_wait(1); // 1us wait
+            timeout--;
+        }
+
+        if (received) {
+            NRF_RADIO->TASKS_STOP = 1; // 停止接收
+            
+            if (NRF_RADIO->CRCSTATUS == 1) {
+                printk("[REPLY!] Freq:%d | RSSI:-%d | Data: ", 2400+current_freq, NRF_RADIO->RSSISAMPLE);
+                for(int i=0; i<32; i++) {
+                    printk("%02X ", packet_buffer[i]);
+                }
+                printk("\n");
+                
+                // 如果收到數據，可能代表喚醒成功，我們可以稍微停在這裡聽久一點
+                k_sleep(K_MSEC(100)); 
+            }
+        } else {
+            // 沒收到，停止接收
+            NRF_RADIO->TASKS_STOP = 1;
+        }
+
+        // 切換下一個頻率繼續嘗試
         ch_idx++;
         if (ch_idx >= CH_COUNT) ch_idx = 0;
+        
+        // 稍微休息一下，不要塞爆 USB Log
+        k_sleep(K_MSEC(10));
     }
 }
