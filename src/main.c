@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2025 White Cat DIY
- * Pico Tracker Scanner - "The Blind Sniffer"
+ * Pico Tracker Scanner - "The Geiger Counter" (Pure Energy Detector)
  */
 
 #include <zephyr/kernel.h>
@@ -11,45 +11,22 @@
 
 #define CONSOLE_DEVICE_LABEL DT_CHOSEN(zephyr_console)
 
-// 這是標準 BLE 廣播地址，配對模式通常用這個
-#define BLE_ACCESS_ADDRESS 0x8E89BED6 
-
-void radio_configure(int channel)
+// 直接操作底層暫存器，繞過所有協議檢查
+void raw_radio_setup(void)
 {
+    // 1. 關閉 Radio 確保安全
     NRF_RADIO->TASKS_DISABLE = 1;
     while (NRF_RADIO->EVENTS_DISABLED == 0);
     NRF_RADIO->EVENTS_DISABLED = 0;
 
-    // 1. 設定速率 (建議先試 Nrf_2Mbit，如果沒反應再改 Nrf_1Mbit)
-    NRF_RADIO->MODE = RADIO_MODE_MODE_Nrf_2Mbit; 
+    // 2. 設定為 1Mbit 模式 (頻譜較寬，最容易捕捉到能量)
+    NRF_RADIO->MODE = RADIO_MODE_MODE_Nrf_1Mbit;
 
-    // 2. 設定頻率
-    NRF_RADIO->FREQUENCY = channel;
-
-    // 3. 設定邏輯地址 (Logical Address)
-    // 我們設定 Base0 + Prefix0
-    NRF_RADIO->BASE0 = (BLE_ACCESS_ADDRESS << 8); 
-    NRF_RADIO->PREFIX0 = (BLE_ACCESS_ADDRESS >> 24) & 0xFF;
+    // 3. 清除所有自動化捷徑
+    NRF_RADIO->SHORTS = 0;
     
-    // 使用邏輯地址 0
-    NRF_RADIO->TXADDRESS = 0;
-    NRF_RADIO->RXADDRESSES = 1;
-
-    // 4. 設定封包格式 (这是关键！我们要设得宽松一点)
-    // S0, S1, L 长度设为标准，但也可能要根据私有协议调整
-    NRF_RADIO->PCNF0 = (0 << RADIO_PCNF0_S1LEN_Pos) |
-                       (0 << RADIO_PCNF0_S0LEN_Pos) |
-                       (8 << RADIO_PCNF0_LFLEN_Pos); 
-
-    // Payload 最大 255 bytes, 不啟用 Whitening (先關掉以排除變數)
-    NRF_RADIO->PCNF1 = (255 << RADIO_PCNF1_MAXLEN_Pos) |
-                       (0 << RADIO_PCNF1_STATLEN_Pos) |
-                       (3 << RADIO_PCNF1_BALEN_Pos) | // Base address length 3 + Prefix 1 = 4 bytes
-                       (RADIO_PCNF1_ENDIAN_Little << RADIO_PCNF1_ENDIAN_Pos) |
-                       (0 << RADIO_PCNF1_WHITEEN_Pos); // 關閉白化
-
-    // 5. 關閉 CRC (為了看到爛封包)
-    NRF_RADIO->CRCCNF = 0; 
+    // 4. 設定預設頻率 (之後會動態改)
+    NRF_RADIO->FREQUENCY = 40; 
 }
 
 int main(void)
@@ -57,56 +34,66 @@ int main(void)
     const struct device *console_dev = DEVICE_DT_GET(CONSOLE_DEVICE_LABEL);
     uint32_t dtr = 0;
 
+    // 啟動 USB Console
     usb_enable(NULL);
+    
+    // 等待電腦連線 (避免錯過 Log)
     while (!dtr) {
         uart_line_ctrl_get(console_dev, UART_LINE_CTRL_DTR, &dtr);
         k_sleep(K_MSEC(100));
     }
 
-    printk("\n>>> BLIND SNIFFER STARTED (Target: 2440 MHz) <<<\n");
+    printk("\n>>> GEIGER COUNTER READY (Scanning 2440 MHz area) <<<\n");
+    printk(">>> Bypassing Address Check... Measuring Pure RF Energy.\n");
 
-    // 設定為你發現強訊號的那個頻道 (例如 40)
-    int target_ch = 40; 
-    radio_configure(target_ch);
+    raw_radio_setup();
 
-    // 準備接收 Buffer
-    static uint8_t rx_buffer[256];
-    NRF_RADIO->PACKETPTR = (uint32_t)rx_buffer;
+    // 掃描範圍：2438 MHz ~ 2442 MHz (Channel 38 - 42)
+    // 稍微掃描周圍，以免晶振頻率飄移
+    int start_ch = 38;
+    int end_ch = 42;
 
     while (1) {
-        // 啟動接收
-        NRF_RADIO->EVENTS_READY = 0;
-        NRF_RADIO->TASKS_RXEN = 1;
-        while (NRF_RADIO->EVENTS_READY == 0);
-        
-        NRF_RADIO->EVENTS_END = 0;
-        NRF_RADIO->TASKS_START = 1;
-
-        // 等待收到封包 或 超時
-        // 這裡我們用一個簡單的計數器當 timeout
-        int timeout = 100000;
-        while (NRF_RADIO->EVENTS_END == 0 && timeout > 0) {
-            timeout--;
-        }
-
-        if (NRF_RADIO->EVENTS_END) {
-            NRF_RADIO->EVENTS_END = 0;
-            NRF_RADIO->TASKS_STOP = 1;
+        for (int ch = start_ch; ch <= end_ch; ch++) {
             
-            // 如果收到了，把資料印出來！
-            // 檢查 RSSI 確保不是雜訊
-            if (NRF_RADIO->RSSISAMPLE > 50) { // 這裡 RSSI 是正數 (0~127)
-                 printk("PKT! RSSI:-%d Data: ", NRF_RADIO->RSSISAMPLE);
-                 for(int i=0; i<10; i++) { // 先印前 10 個 byte 看看
-                     printk("%02X ", rx_buffer[i]);
-                 }
-                 printk("\n");
-            }
-        } else {
-            // Timeout，重來
-            NRF_RADIO->TASKS_STOP = 1;
+            // 1. 切換頻率前先停機
+            NRF_RADIO->TASKS_DISABLE = 1; 
+            while (NRF_RADIO->EVENTS_DISABLED == 0); 
+            NRF_RADIO->EVENTS_DISABLED = 0;
+            
+            NRF_RADIO->FREQUENCY = ch;
+
+            // 2. 開啟接收 (RXEN)
+            NRF_RADIO->EVENTS_READY = 0;
+            NRF_RADIO->TASKS_RXEN = 1;
+            while (NRF_RADIO->EVENTS_READY == 0); // 等待 Radio 暖機 (約 130us)
+            NRF_RADIO->EVENTS_READY = 0;
+
+            // 3. === 關鍵 === 直接啟動 RSSI 測量，不等待封包！
+            NRF_RADIO->EVENTS_RSSIEND = 0;
+            NRF_RADIO->TASKS_RSSISTART = 1;
+            
+            // 等待測量完成
+            while (NRF_RADIO->EVENTS_RSSIEND == 0);
+            NRF_RADIO->EVENTS_RSSIEND = 0;
+
+            // 4. 讀取數值 (數值是負的 dBm，但在暫存器裡是正數)
+            uint8_t sample = NRF_RADIO->RSSISAMPLE;
+            int rssi = -1 * (int)sample;
+
+            // 5. 判斷與顯示
+            // -90 dBm 左右是空氣雜訊 (沒訊號)
+            // > -70 dBm 代表有強訊號
+            if (rssi > -75) {
+                printk("[Hit!] %d MHz | RSSI: %d dBm <--- TARGET DETECTED!\n", 2400 + ch, rssi);
+            } 
+            // 如果你想看它是活著的，可以取消下面這行的註解，但會洗版
+            // else { printk("."); } 
+            
+            // 稍微停一下
+            k_busy_wait(2000); 
         }
-        
-        k_sleep(K_MSEC(10));
+        // 換行分隔
+        // printk("\n");
     }
 }
