@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2025 White Cat DIY
- * Pico Tracker Scanner - "The Geiger Counter" (Pure Energy Detector)
+ * Pico Tracker Sniffer - "The Ambush" (Targeted Hopping)
  */
 
 #include <zephyr/kernel.h>
@@ -11,89 +11,87 @@
 
 #define CONSOLE_DEVICE_LABEL DT_CHOSEN(zephyr_console)
 
-// 直接操作底層暫存器，繞過所有協議檢查
-void raw_radio_setup(void)
+// 🔑 我們的黃金鑰匙
+#define MY_BASE_ADDR  0x552c6a1eUL
+#define MY_PREFIX     0xC0
+
+// 🎯 我們剛剛發現的 "據點" (根據你的 read32 結果)
+// 你可以再多抓幾次 read32 看看有沒有別的，目前的 1, 37, 77 是確定的
+static const int ambush_channels[] = {1, 37, 77};
+#define CHANNEL_COUNT 3
+
+void radio_setup(int channel)
 {
-    // 1. 關閉 Radio 確保安全
     NRF_RADIO->TASKS_DISABLE = 1;
     while (NRF_RADIO->EVENTS_DISABLED == 0);
     NRF_RADIO->EVENTS_DISABLED = 0;
 
-    // 2. 設定為 1Mbit 模式 (頻譜較寬，最容易捕捉到能量)
-    NRF_RADIO->MODE = RADIO_MODE_MODE_Nrf_1Mbit;
-
-    // 3. 清除所有自動化捷徑
-    NRF_RADIO->SHORTS = 0;
+    NRF_RADIO->FREQUENCY = channel;
     
-    // 4. 設定預設頻率 (之後會動態改)
-    NRF_RADIO->FREQUENCY = 40; 
+    // 設定 2Mbit
+    NRF_RADIO->MODE = RADIO_MODE_MODE_Nrf_2Mbit; 
+
+    // 地址設定
+    NRF_RADIO->BASE0 = MY_BASE_ADDR;
+    NRF_RADIO->PREFIX0 = MY_PREFIX;
+    NRF_RADIO->TXADDRESS = 0;
+    NRF_RADIO->RXADDRESSES = 1;
+
+    // 封包格式
+    NRF_RADIO->PCNF0 = 0;
+    NRF_RADIO->PCNF1 = (32 << RADIO_PCNF1_MAXLEN_Pos) | (4 << RADIO_PCNF1_BALEN_Pos) | (RADIO_PCNF1_ENDIAN_Little << RADIO_PCNF1_ENDIAN_Pos);
+
+    // CRC
+    NRF_RADIO->CRCCNF = (RADIO_CRCCNF_LEN_Two << RADIO_CRCCNF_LEN_Pos); 
+    NRF_RADIO->CRCINIT = 0xFFFF;      
+    NRF_RADIO->CRCPOLY = 0x11021;      
+    
+    NRF_RADIO->SHORTS = 0;
 }
 
 int main(void)
 {
     const struct device *console_dev = DEVICE_DT_GET(CONSOLE_DEVICE_LABEL);
     uint32_t dtr = 0;
+    static uint8_t packet_buffer[32];
 
-    // 啟動 USB Console
     usb_enable(NULL);
-    
-    // 等待電腦連線 (避免錯過 Log)
     while (!dtr) {
         uart_line_ctrl_get(console_dev, UART_LINE_CTRL_DTR, &dtr);
         k_sleep(K_MSEC(100));
     }
 
-    printk("\n>>> GEIGER COUNTER READY (Scanning 2440 MHz area) <<<\n");
-    printk(">>> Bypassing Address Check... Measuring Pure RF Energy.\n");
+    printk("\n>>> AMBUSH SET: Waiting for Helmet on Ch 1, 37, 77... <<<\n");
 
-    raw_radio_setup();
-
-    // 掃描範圍：2438 MHz ~ 2442 MHz (Channel 38 - 42)
-    // 稍微掃描周圍，以免晶振頻率飄移
-    int start_ch = 38;
-    int end_ch = 42;
+    int ch_idx = 0;
 
     while (1) {
-        for (int ch = start_ch; ch <= end_ch; ch++) {
-            
-            // 1. 切換頻率前先停機
-            NRF_RADIO->TASKS_DISABLE = 1; 
-            while (NRF_RADIO->EVENTS_DISABLED == 0); 
-            NRF_RADIO->EVENTS_DISABLED = 0;
-            
-            NRF_RADIO->FREQUENCY = ch;
+        int current_ch = ambush_channels[ch_idx];
+        radio_setup(current_ch);
+        NRF_RADIO->PACKETPTR = (uint32_t)packet_buffer;
 
-            // 2. 開啟接收 (RXEN)
-            NRF_RADIO->EVENTS_READY = 0;
-            NRF_RADIO->TASKS_RXEN = 1;
-            while (NRF_RADIO->EVENTS_READY == 0); // 等待 Radio 暖機 (約 130us)
-            NRF_RADIO->EVENTS_READY = 0;
+        // 啟動接收
+        NRF_RADIO->EVENTS_READY = 0;
+        NRF_RADIO->TASKS_RXEN = 1;
+        while(NRF_RADIO->EVENTS_READY == 0);
+        
+        NRF_RADIO->EVENTS_END = 0;
+        NRF_RADIO->TASKS_START = 1;
 
-            // 3. === 關鍵 === 直接啟動 RSSI 測量，不等待封包！
-            NRF_RADIO->EVENTS_RSSIEND = 0;
-            NRF_RADIO->TASKS_RSSISTART = 1;
-            
-            // 等待測量完成
-            while (NRF_RADIO->EVENTS_RSSIEND == 0);
-            NRF_RADIO->EVENTS_RSSIEND = 0;
+        // 每個頻道埋伏 100ms
+        // 因為頭盔如果來找它，一定會瘋狂發射，我們不用跳太快
+        k_busy_wait(100000); 
 
-            // 4. 讀取數值 (數值是負的 dBm，但在暫存器裡是正數)
-            uint8_t sample = NRF_RADIO->RSSISAMPLE;
-            int rssi = -1 * (int)sample;
-
-            // 5. 判斷與顯示
-            // -90 dBm 左右是空氣雜訊 (沒訊號)
-            // > -70 dBm 代表有強訊號
-            if (rssi > -75) {
-                printk("[Hit!] %d MHz | RSSI: %d dBm <--- TARGET DETECTED!\n", 2400 + ch, rssi);
-            } 
-            // 如果你想看它是活著的，可以取消下面這行的註解，但會洗版
-            // else { printk("."); } 
-            
-            // 稍微停一下
-            k_busy_wait(2000); 
+        if (NRF_RADIO->EVENTS_END) {
+            if (NRF_RADIO->CRCSTATUS == 1) {
+                printk("[CAPTURED!] Ch:%d | Data: ", current_ch);
+                for(int i=0; i<10; i++) printk("%02X ", packet_buffer[i]);
+                printk("\n");
+            }
         }
-        // 換行分隔
-        // printk("\n");
+        
+        // 換下一個埋伏點
+        ch_idx++;
+        if (ch_idx >= CHANNEL_COUNT) ch_idx = 0;
     }
 }
