@@ -1,9 +1,7 @@
 /*
- * Pico Tracker Rescue Scanner
- * Features:
- * 1. Starts HFCLK explicitely (Fixes potential crash)
- * 2. Uses LOG_INF (Matches boot log format)
- * 3. Blinks LED (Visual confirmation)
+ * Pico Tracker Rescue Scanner (Fixed Compile Error)
+ * 1. Fixed clock_control API usage for Zephyr v4+
+ * 2. Kept LOG_INF and LED logic
  */
 
 #include <zephyr/kernel.h>
@@ -14,7 +12,7 @@
 #include <zephyr/drivers/clock_control.h>
 #include <zephyr/drivers/clock_control/nrf_clock_control.h>
 
-// 註冊 Log 模組，這樣會跟 Booting 訊息用一樣的通道
+// 註冊 Log 模組
 LOG_MODULE_REGISTER(scanner, LOG_LEVEL_INF);
 
 // === 參數 ===
@@ -22,35 +20,35 @@ LOG_MODULE_REGISTER(scanner, LOG_LEVEL_INF);
 #define TARGET_PREFIX     0xC0
 #define CH_FREQ           1 
 
-// 嘗試定義 LED (nRF52840 Dongle 的綠燈通常是 P0.06)
-// 如果您的板子定義不同，這行可能無效，但不影響程式執行
+// LED 定義
 #define LED0_NODE DT_ALIAS(led0)
 static const struct gpio_dt_spec led = GPIO_DT_SPEC_GET(LED0_NODE, gpios);
 
 static uint8_t rx_buffer[32]; 
 
-// 啟動外部晶振 (Radio 必須)
+// [修正] 簡化後的時脈啟動函數，不使用結構體，直接調用
 void start_clock(void) {
     const struct device *clock = DEVICE_DT_GET(DT_NODELABEL(clock));
     if (!device_is_ready(clock)) {
         LOG_ERR("Clock device not ready!");
         return;
     }
-    // 請求啟動 HFXO
-    struct clock_control_nrf_clock_spec clock_spec = {
-        .frequency = CLOCK_CONTROL_NRF_SUBSYS_HF,
-        .accuracy = CLOCK_CONTROL_NRF_ACCURACY_HIGH,
-        .precision = 0,
-    };
-    clock_control_on(clock, (void *)&clock_spec);
-    // 等待時脈穩定有點複雜，但在 Zephyr 裡通常請求後系統會處理
+    
+    // 直接請求啟動 HFCLK (High Frequency Clock)
+    // 這是讓 Radio 正常運作的關鍵
+    int ret = clock_control_on(clock, CLOCK_CONTROL_NRF_SUBSYS_HF);
+    if (ret < 0) {
+        LOG_ERR("Failed to start clock: %d", ret);
+    }
+    
+    // 稍微等待穩定
     k_sleep(K_MSEC(10)); 
 }
 
 void radio_init(void) {
     // 確保 Radio 關閉
     NRF_RADIO->TASKS_DISABLE = 1;
-    k_busy_wait(1000); // 簡單延遲
+    k_busy_wait(1000); 
     NRF_RADIO->EVENTS_DISABLED = 0;
 
     NRF_RADIO->MODE = RADIO_MODE_MODE_Nrf_2Mbit;
@@ -60,7 +58,7 @@ void radio_init(void) {
     NRF_RADIO->TXADDRESS = 0;
     NRF_RADIO->RXADDRESSES = 1;
     
-    // PCNF0: LFLEN=4
+    // 設定 LFLEN = 4
     NRF_RADIO->PCNF0 = (4 << RADIO_PCNF0_LFLEN_Pos);
     
     // PCNF1
@@ -81,18 +79,17 @@ int main(void)
     // 1. 啟動 USB
     if (usb_enable(NULL)) return 0;
 
-    // 2. 啟動 LED
+    // 2. 啟動 LED (如果有)
     if (device_is_ready(led.port)) {
         gpio_pin_configure_dt(&led, GPIO_OUTPUT_ACTIVE);
     }
 
-    // 3. [關鍵] 啟動 HFCLK
+    // 3. 啟動時脈
     start_clock();
 
-    // 緩衝一下
+    // 緩衝一下，讓您有時間連上 Serial Monitor
     k_sleep(K_MSEC(2000));
     
-    // 使用 LOG_INF 印出，這跟 Booting 訊息是一路的
     LOG_INF("==============================");
     LOG_INF(">>> RESCUE SCANNER STARTED <<<");
     LOG_INF("==============================");
@@ -110,6 +107,7 @@ int main(void)
             NRF_RADIO->EVENTS_END = 0;
             if (NRF_RADIO->CRCSTATUS == 1) {
                 LOG_INF("!!! PACKET RECEIVED !!!");
+                // 印出 Hex 數據
                 LOG_HEXDUMP_INF(rx_buffer, 16, "Payload:");
                 NRF_RADIO->TASKS_START = 1;
             } else {
@@ -117,15 +115,21 @@ int main(void)
             }
         }
 
-        // 心跳機制: 每 100ms 檢查一次，每 1 秒閃燈+印字
+        // 避免 CPU 100% 佔用
         k_busy_wait(100000); // 100ms
         counter++;
         
-        if (counter % 10 == 0) { // 每秒執行
+        // 每秒閃燈 + 印狀態
+        if (counter % 10 == 0) { 
             if (device_is_ready(led.port)) {
-                gpio_pin_toggle_dt(&led); // 閃燈
+                gpio_pin_toggle_dt(&led);
             }
-            LOG_INF("Scanning... (Radio State: %d)", NRF_RADIO->STATE);
+            // 印出 Radio 狀態以供診斷 (3 = RX_IDLE, 0 = DISABLED)
+            // 正常運作應該要是 3
+            // LOG_INF("Scanning... Radio State: %d", (int)NRF_RADIO->STATE);
+            
+            // 為了版面乾淨，我們先印一個點就好，若有收到包會插隊印出來
+            printk("."); 
         }
     }
 }
