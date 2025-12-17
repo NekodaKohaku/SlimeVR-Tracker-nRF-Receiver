@@ -1,20 +1,20 @@
 /*
- * Pico Tracker PASSIVE Scanner (Safe Version)
- * Strategy: Listen ONLY. Cycle LFLEN. Wait for USB connection.
+ * Pico Tracker PASSIVE Scanner (No-Wait Version)
+ * Strategy: Listen ONLY. Cycle LFLEN. 
+ * Fix: Removed DTR wait loop so it starts immediately.
  */
 
 #include <zephyr/kernel.h>
 #include <zephyr/sys/printk.h>
 #include <hal/nrf_radio.h>
 #include <zephyr/usb/usb_device.h>
-#include <zephyr/drivers/uart.h> // 用來偵測 DTR 連線
 
 // === 參數設定 ===
 #define TARGET_BASE_ADDR  0x552c6a1eUL
 #define TARGET_PREFIX     0xC0
 #define CH_FREQ           1 
 
-// 測試清單 (優先測試 4，因為您的 PCNF0 讀數是 4)
+// 測試清單 (優先測試 4，因為這是最大嫌疑)
 static const uint8_t lflen_candidates[] = {4, 6, 8, 0};
 #define CANDIDATE_COUNT 4
 
@@ -45,7 +45,7 @@ void radio_configure_rx(uint8_t lflen_val)
     NRF_RADIO->TXADDRESS = 0;
     NRF_RADIO->RXADDRESSES = 1;
 
-    // 3. 設定 LFLEN (變數)
+    // 3. 設定 LFLEN
     // 加上 \n 確保緩衝區輸出
     printk("Scanning LFLEN = %d bits... \n", lflen_val);
 
@@ -53,13 +53,13 @@ void radio_configure_rx(uint8_t lflen_val)
 
     // 4. 設定 PCNF1
     if (lflen_val > 0) {
-        // 動態長度模式: 硬體讀取長度欄位
+        // 動態長度模式
         NRF_RADIO->PCNF1 = (32 << RADIO_PCNF1_MAXLEN_Pos) | 
                            (0  << RADIO_PCNF1_STATLEN_Pos) | 
                            (4  << RADIO_PCNF1_BALEN_Pos) | 
                            (RADIO_PCNF1_ENDIAN_Little << RADIO_PCNF1_ENDIAN_Pos);
     } else {
-        // 固定長度模式: 強制抓 32 bytes
+        // 固定長度模式
         NRF_RADIO->PCNF1 = (32 << RADIO_PCNF1_MAXLEN_Pos) | 
                            (32 << RADIO_PCNF1_STATLEN_Pos) | 
                            (4  << RADIO_PCNF1_BALEN_Pos) | 
@@ -80,20 +80,12 @@ int main(void)
     // 1. 啟動 USB
     if (usb_enable(NULL)) return 0;
 
-    // 2. [關鍵] 等待 Arduino 視窗打開 (DTR 訊號)
-    // 這是解決「看不到字」的最重要步驟
-    const struct device *dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_console));
-    uint32_t dtr = 0;
+    // 2. [關鍵修正] 不再等待 DTR 連線，直接睡 3 秒緩衝
+    // 這 3 秒是給您時間打開 Arduino 視窗的，錯過也沒關係，後面會一直循環
+    k_sleep(K_MSEC(3000)); 
     
-    // 如果您不想等，可以把這段 while 註解掉，但可能會漏看開頭
-    while (!dtr) {
-        uart_line_ctrl_get(dev, UART_LINE_CTRL_DTR, &dtr);
-        k_sleep(K_MSEC(100));
-    }
-    
-    k_sleep(K_MSEC(500)); // 再多等一下讓視窗穩動
     printk("\n=========================================\n");
-    printk(">>> PASSIVE SCANNER STARTED (Waiting for DTR) <<<\n");
+    printk(">>> PASSIVE SCANNER STARTED (Immediate) <<<\n");
     printk("=========================================\n");
 
     int current_idx = 0;
@@ -113,7 +105,9 @@ int main(void)
         // 監聽視窗: 200ms
         // 如果這 200ms 內 Tracker 有發射，我們就應該收到
         bool packet_found = false;
-        for (int t = 0; t < 200; t++) { // 200ms
+        
+        // 使用迴圈檢查多次，提高解析度
+        for (int t = 0; t < 200; t++) { // 200ms loop
             if (NRF_RADIO->EVENTS_END) {
                 NRF_RADIO->EVENTS_END = 0;
                 
@@ -126,7 +120,7 @@ int main(void)
                     NRF_RADIO->TASKS_START = 1; 
                 }
             }
-            k_busy_wait(1000); // 1ms
+            k_busy_wait(1000); // 1ms wait
         }
 
         // 檢查結果
