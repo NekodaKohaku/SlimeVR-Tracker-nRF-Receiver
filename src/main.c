@@ -1,7 +1,7 @@
 /*
- * Pico Tracker Receiver - The "Nibble Length" Fix
- * Hypothesis: LFLEN is 4 bits (Value 4).
- * This fits the '4' you saw and allows 8-byte payloads (max 15).
+ * Pico Tracker Raw Sniffer
+ * Strategy: Disable CRC, Disable Length Parsing.
+ * Goal: Capture raw bitstream to deduce LFLEN and Endianness.
  */
 
 #include <zephyr/kernel.h>
@@ -9,14 +9,14 @@
 #include <hal/nrf_radio.h>
 #include <zephyr/usb/usb_device.h>
 
-// 參數設定
+// 參數設定 (已知正確的)
 #define TARGET_BASE_ADDR  0x552c6a1eUL
 #define TARGET_PREFIX     0xC0
 #define RX_FREQ           1 
 
 static uint8_t rx_buffer[32];
 
-void radio_configure(void)
+void radio_configure_raw(void)
 {
     NRF_RADIO->TASKS_DISABLE = 1;
     while (NRF_RADIO->EVENTS_DISABLED == 0);
@@ -25,28 +25,28 @@ void radio_configure(void)
     NRF_RADIO->MODE = RADIO_MODE_MODE_Nrf_2Mbit;
     NRF_RADIO->FREQUENCY = RX_FREQ;
 
+    // 地址設定 (這是我們唯一的濾網，只要地址對就抓)
     NRF_RADIO->BASE0 = TARGET_BASE_ADDR;
     NRF_RADIO->PREFIX0 = TARGET_PREFIX;
     NRF_RADIO->TXADDRESS = 0;
     NRF_RADIO->RXADDRESSES = 1; 
 
-    // [關鍵修正] PCNF0
-    // LFLEN = 4 bits (對應數值 4)
-    // 這意味著封包的開頭 4 個 bit 是長度，後面接著數據
-    NRF_RADIO->PCNF0 = (4 << RADIO_PCNF0_LFLEN_Pos);
+    // [關鍵 1] LFLEN 設為 0
+    // 我們不讓硬體去解析長度，直接把長度欄位當成數據的一部分抓進來
+    NRF_RADIO->PCNF0 = (0 << RADIO_PCNF0_LFLEN_Pos);
 
-    // [修正] PCNF1
-    // 恢復為我們在 dump 2 看到的合理值：MaxLen 8, Balen 4
-    // 雖然您剛讀到 4，但 Balen=0 風險太大，我們先用標準的 4 byte Base
-    NRF_RADIO->PCNF1 = (8 << RADIO_PCNF1_MAXLEN_Pos) | 
-                       (0 << RADIO_PCNF1_STATLEN_Pos) | // 依賴 LFLEN
+    // [關鍵 2] 強制接收 32 Bytes
+    // 不管它實際發多長，我們都開大口咬下去
+    NRF_RADIO->PCNF1 = (32 << RADIO_PCNF1_MAXLEN_Pos) | 
+                       (32 << RADIO_PCNF1_STATLEN_Pos) | // Static Length = 32
                        (4 << RADIO_PCNF1_BALEN_Pos) | 
                        (RADIO_PCNF1_ENDIAN_Little << RADIO_PCNF1_ENDIAN_Pos);
 
-    NRF_RADIO->CRCCNF = (RADIO_CRCCNF_LEN_Two << RADIO_CRCCNF_LEN_Pos);
-    NRF_RADIO->CRCINIT = 0xFFFF;
-    NRF_RADIO->CRCPOLY = 0x11021;
+    // [關鍵 3] 徹底關閉 CRC
+    // 這樣就算格式錯位，Radio 也不會把封包丟掉
+    NRF_RADIO->CRCCNF = 0; // Disable CRC
 
+    // 收完一包自動關閉，方便我們讀取
     NRF_RADIO->SHORTS = (RADIO_SHORTS_READY_START_Msk | RADIO_SHORTS_END_DISABLE_Msk);
 }
 
@@ -54,32 +54,35 @@ int main(void)
 {
     if (usb_enable(NULL)) return 0;
     k_sleep(K_MSEC(2000));
-    printk(">>> RECEIVER TRYING LFLEN=4 <<<\n");
+    printk(">>> RAW SNIFFER STARTED (NO CRC) <<<\n");
+    printk("Target: 0x%X (Prefix 0x%X)\n", TARGET_BASE_ADDR, TARGET_PREFIX);
 
-    radio_configure();
+    radio_configure_raw();
 
     while (1) {
-        NRF_RADIO->PACKETPTR = (uint32_t)rx_buffer;
+        // 清空 Buffer (填入 FF 以便觀察哪些位元被寫入)
+        for(int i=0; i<32; i++) rx_buffer[i] = 0xFF;
         
-        // 為了讓測試更穩定，每次接收前先清空 CRC 狀態
+        NRF_RADIO->PACKETPTR = (uint32_t)rx_buffer;
         NRF_RADIO->EVENTS_END = 0;
         NRF_RADIO->TASKS_RXEN = 1;
 
-        // 等待接收 (Bus Wait)
-        // 這裡設定較長的 Timeout，確保有抓到
-        for(int i=0; i<2000; i++) {
-            if (NRF_RADIO->EVENTS_END) {
-                NRF_RADIO->EVENTS_END = 0;
-                
-                if (NRF_RADIO->CRCSTATUS == 1) {
-                    printk("[RX] SUCCESS! LFLEN=4 Works! | Payload: ");
-                    for(int k=0; k<10; k++) printk("%02X ", rx_buffer[k]);
-                    printk("\n");
-                }
-                NRF_RADIO->TASKS_START = 1; // 繼續收
-                break;
-            }
+        // 等待接收 (死守)
+        // 因為關閉了 CRC，只要有任何符合地址的訊號，EVENTS_END 就會觸發
+        while (NRF_RADIO->EVENTS_END == 0) {
+            // 如果太久沒收到 (例如 1秒)，可以重置一下
+            // 但為了抓配對包，我們就一直等
             k_busy_wait(10);
         }
+
+        // 收到數據了！(不管對錯)
+        printk("[RAW] Data: ");
+        for(int k=0; k<16; k++) { // 先印前 16 byte
+            printk("%02X ", rx_buffer[k]);
+        }
+        printk("\n");
+
+        // 稍微暫停，避免洗版太快
+        k_sleep(K_MSEC(100));
     }
 }
