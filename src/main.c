@@ -1,7 +1,8 @@
 /*
- * Copyright (c) 2025 White Cat DIY
- * Pico Tracker Activator - Targeting Event 3 (State 2)
- * Target: 0xC0552C6A1E
+ * Pico Tracker 2.0 Receiver for SlimeVR
+ * Based on reverse engineered parameters:
+ * Address: 0xC0552C6A1E
+ * Freq Hopping: 2401, 2437, 2477 MHz
  */
 
 #include <zephyr/kernel.h>
@@ -9,22 +10,34 @@
 #include <hal/nrf_radio.h>
 #include <zephyr/usb/usb_device.h>
 
-// 🔑 目標地址 (逆向確認)
+// ==========================================
+// 1. 配置參數
+// ==========================================
 #define TARGET_BASE_ADDR  0x552c6a1eUL
 #define TARGET_PREFIX     0xC0
 
-// 📡 頻率表 (涵蓋所有跳頻點)
-static const int channels[] = {1, 37, 77, 40};
-#define CH_COUNT 4
+// 頻率表 (我們鎖定追蹤器會跳的那三個)
+static const int channels[] = {1, 37, 77};
+#define CH_COUNT 3
 
-static uint8_t packet_buffer[32];
+// 接收緩衝區
+static uint8_t rx_buffer[32];
+// ACK 緩衝區 (有些 ESB 設備需要 ACK 帶 Payload)
+static uint8_t ack_payload[32] = {0}; 
 
-// 設定 Radio 參數
-void radio_configure(int channel)
-{
+// ==========================================
+// 2. 無線電底層函式
+// ==========================================
+
+void radio_disable(void) {
     NRF_RADIO->TASKS_DISABLE = 1;
     while (NRF_RADIO->EVENTS_DISABLED == 0);
     NRF_RADIO->EVENTS_DISABLED = 0;
+}
+
+void radio_configure(int channel)
+{
+    radio_disable();
 
     NRF_RADIO->FREQUENCY = channel;
     NRF_RADIO->MODE = RADIO_MODE_MODE_Nrf_2Mbit; 
@@ -32,117 +45,94 @@ void radio_configure(int channel)
     // 設定地址
     NRF_RADIO->BASE0 = TARGET_BASE_ADDR;
     NRF_RADIO->PREFIX0 = TARGET_PREFIX;
+    NRF_RADIO->TXADDRESS = 0;
+    NRF_RADIO->RXADDRESSES = 1; // Enable Logical addr 0
+
+    // PCNF0: S0=0, LEN=8bit, S1=0 (標準 ESB 結構，LEN欄位很重要)
+    // 如果追蹤器不使用 Dynamic Length，這裡可能要設全0。
+    // 但根據 pyocd 讀出的 0x40001514 (PCNF1) 的值，我們試試標準設定。
+    NRF_RADIO->PCNF0 = (8 << RADIO_PCNF0_LFLEN_Pos); 
     
-    // CRC 設定 (必須正確才能收到回應)
+    // PCNF1: MaxLen 32, Balen 4, Whiteen 0
+    NRF_RADIO->PCNF1 = (32 << RADIO_PCNF1_MAXLEN_Pos) | 
+                       (32 << RADIO_PCNF1_STATLEN_Pos) | // Static len
+                       (4 << RADIO_PCNF1_BALEN_Pos) | 
+                       (RADIO_PCNF1_ENDIAN_Little << RADIO_PCNF1_ENDIAN_Pos);
+
+    // CRC 設定
     NRF_RADIO->CRCCNF = (RADIO_CRCCNF_LEN_Two << RADIO_CRCCNF_LEN_Pos); 
-    NRF_RADIO->CRCINIT = 0xFFFF;      
+    NRF_RADIO->CRCINIT = 0xFFFF;       
     NRF_RADIO->CRCPOLY = 0x11021; 
     
-    NRF_RADIO->SHORTS = 0;
+    // Shortcut: 收到後自動校驗 CRC
+    NRF_RADIO->SHORTS = (RADIO_SHORTS_READY_START_Msk | RADIO_SHORTS_END_DISABLE_Msk);
 }
 
-// 設定為發射模式
-void setup_tx(void) {
-    NRF_RADIO->TXADDRESS = 0; 
-    NRF_RADIO->RXADDRESSES = 0;
-    NRF_RADIO->PCNF0 = 0;
-    // MaxLen 32, Balen 4
-    NRF_RADIO->PCNF1 = (32 << RADIO_PCNF1_MAXLEN_Pos) | (4 << RADIO_PCNF1_BALEN_Pos) | (RADIO_PCNF1_ENDIAN_Little << RADIO_PCNF1_ENDIAN_Pos);
-}
-
-// 設定為接收模式
-void setup_rx(void) {
-    NRF_RADIO->TXADDRESS = 0; 
-    NRF_RADIO->RXADDRESSES = 1; // Enable Logical addr 0
-    NRF_RADIO->PCNF0 = 0;
-    NRF_RADIO->PCNF1 = (32 << RADIO_PCNF1_MAXLEN_Pos) | (4 << RADIO_PCNF1_BALEN_Pos) | (RADIO_PCNF1_ENDIAN_Little << RADIO_PCNF1_ENDIAN_Pos);
-}
+// ==========================================
+// 3. 主程式
+// ==========================================
 
 int main(void)
 {
-    usb_enable(NULL);
-    k_sleep(K_MSEC(1000)); // 等待 USB 穩定
-
-    printk("\n>>> ACTIVATOR STARTED: Sending COMMAND 0x03 <<<\n");
+    // 初始化 USB
+    if (usb_enable(NULL)) {
+        return;
+    }
+    k_sleep(K_MSEC(1000));
+    printk(">>> PICO TRACKER RECEIVER STARTED <<<\n");
 
     int ch_idx = 0;
 
     while (1) {
+        // 1. 設定頻率
         int current_freq = channels[ch_idx];
         radio_configure(current_freq);
 
-        // ==========================================
-        // 1. 發射指令 (嘗試觸發 Event 3)
-        // ==========================================
-        setup_tx();
-        
-        // 🛠️ 這裡是可以修改指令的地方
-        // 0x03 -> 對應 Event 3 (推測為 Active Mode)
-        // 0x02 -> 對應 Event 2 (推測為 Shutdown)
-        // 0x04 -> 對應 Event 4 (推測為 Calibration)
-        packet_buffer[0] = 0x00;
-        packet_buffer[1] = 0x03; // <--- 目前測試 03
-        packet_buffer[2] = 0x00;
-        
-        NRF_RADIO->PACKETPTR = (uint32_t)packet_buffer;
-        
-        NRF_RADIO->EVENTS_READY = 0;
-        NRF_RADIO->TASKS_TXEN = 1;
-        while(NRF_RADIO->EVENTS_READY == 0);
-        
-        NRF_RADIO->EVENTS_END = 0;
-        NRF_RADIO->TASKS_START = 1;
-        while(NRF_RADIO->EVENTS_END == 0);
-        
-        NRF_RADIO->TASKS_DISABLE = 1;
-        while(NRF_RADIO->EVENTS_DISABLED == 0);
-
-        // ==========================================
-        // 2. 監聽回應 (看有沒有數據噴出來)
-        // ==========================================
-        setup_rx();
-        
-        // 清空 Buffer 以便識別新數據
-        for(int i=0; i<32; i++) packet_buffer[i] = 0x00; 
-        NRF_RADIO->PACKETPTR = (uint32_t)packet_buffer;
-
-        NRF_RADIO->EVENTS_READY = 0;
+        // 2. 進入 RX 模式
+        NRF_RADIO->PACKETPTR = (uint32_t)rx_buffer;
         NRF_RADIO->TASKS_RXEN = 1;
-        while(NRF_RADIO->EVENTS_READY == 0);
-        
-        NRF_RADIO->EVENTS_END = 0;
-        NRF_RADIO->TASKS_START = 1;
 
-        // 監聽 5ms (如果有數據流，應該很快就會收到)
-        int timeout = 5000; 
-        int received = 0;
-        while(timeout > 0) {
-            if (NRF_RADIO->EVENTS_END) {
+        // 3. 等待接收 (或超時)
+        // 這裡我們只等一小段時間，因為如果這個頻率沒人，我們就要趕快去下一個頻率找
+        // 追蹤器跳頻很快，我們掃描也要快
+        bool received = false;
+        for(int i=0; i<500; i++) { // 約 5ms 超時
+            if (NRF_RADIO->EVENTS_DISABLED) {
+                // 收到封包且 CRC 正確 (因為 SHORTS 設定了 END_DISABLE)
                 if (NRF_RADIO->CRCSTATUS == 1) {
-                    received = 1;
-                    break;
+                    received = true;
                 }
-                // 如果 CRC 錯，重置 Event 繼續聽
-                NRF_RADIO->EVENTS_END = 0; 
-                NRF_RADIO->TASKS_START = 1; 
+                NRF_RADIO->EVENTS_DISABLED = 0;
+                break;
             }
-            k_busy_wait(1);
-            timeout--;
+            k_busy_wait(10);
         }
 
+        // 4. 處理數據
         if (received) {
-            NRF_RADIO->TASKS_STOP = 1;
-            printk("[RX] Freq:%d Data: ", current_freq);
-            for(int i=0; i<32; i++) printk("%02X ", packet_buffer[i]);
-            printk("\n");
-        } else {
-            NRF_RADIO->TASKS_STOP = 1;
-        }
+            // 打印出來分析 (SlimeVR 需要的格式後續再加)
+            printk("RX Freq:%d [", current_freq);
+            for(int i=0; i<16; i++) printk("%02X ", rx_buffer[i]); // 先看前16 byte
+            printk("]\n");
 
-        // 切換下一個頻率
-        ch_idx++;
-        if (ch_idx >= CH_COUNT) ch_idx = 0;
-        
-        k_sleep(K_MSEC(5)); // 稍微休息，發太快也不好
+            // TODO: 解析 rx_buffer 裡的四元數 (Float x 4)
+            // TODO: 發送 ACK (如果不發 ACK，追蹤器可能會一直重傳同一包)
+            // 簡單的發送 ACK (切換 TX 發一個空包)
+            /*
+            NRF_RADIO->SHORTS = RADIO_SHORTS_READY_START_Msk | RADIO_SHORTS_END_DISABLE_Msk;
+            NRF_RADIO->PACKETPTR = (uint32_t)ack_payload;
+            NRF_RADIO->TASKS_TXEN = 1;
+            while(!NRF_RADIO->EVENTS_DISABLED);
+            NRF_RADIO->EVENTS_DISABLED = 0;
+            */
+            
+            // 如果在當前頻率抓到了，就不要急著跳走，多聽一會兒
+            // 這樣可以鎖定住追蹤器
+            k_sleep(K_MSEC(2)); 
+        } else {
+            // 沒收到，去下一個頻率
+            ch_idx++;
+            if (ch_idx >= CH_COUNT) ch_idx = 0;
+        }
     }
 }
