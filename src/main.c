@@ -14,7 +14,7 @@
 // ==========================================
 // 我們從 pyocd 讀出的地址 BASE0: 0x552C6A1E, PREFIX0: 0xC0
 #define TARGET_BASE_ADDR  0x552c6a1eUL
-#define TARGET_PREFIX     0xC0
+#define TARGET_PREFIX     0x43
 
 // 鎖定 Channel 1 (2401 MHz)
 // 雖然它會跳頻 (1->37->77)，但我們守在這裡一定抓得到
@@ -49,11 +49,11 @@ void radio_configure(void)
     // === 封包格式 (Packet Configuration) ===
     // 根據逆向，它是 ESB DPL (Dynamic Payload Length)
     // PCNF0: LFLEN=8bit (1 byte 長度欄位), S0=0, S1=0
-    NRF_RADIO->PCNF0 = (8 << RADIO_PCNF0_LFLEN_Pos);
+    NRF_RADIO->PCNF0 = 0;
 
     // PCNF1: MaxLen=32, BalLen=4 (地址長度), Endian=Little
     NRF_RADIO->PCNF1 = (32 << RADIO_PCNF1_MAXLEN_Pos) | 
-                       (32 << RADIO_PCNF1_STATLEN_Pos) |
+                       (32 << RADIO_PCNF1_STATLEN_Pos) | // 強制讀取 32 bytes
                        (4 << RADIO_PCNF1_BALEN_Pos) | 
                        (RADIO_PCNF1_ENDIAN_Little << RADIO_PCNF1_ENDIAN_Pos);
 
