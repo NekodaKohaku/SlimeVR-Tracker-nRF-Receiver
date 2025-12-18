@@ -1,10 +1,8 @@
 /*
- * Pico Tracker EXACT CLONE RECEIVER
- * Based on pyocd dump:
- * - MODE: Ble_2Mbit (Val: 4) <--- CRITICAL FIX
- * - LFLEN: 8 bits
- * - S1LEN: 4 bits
- * - ADDR: C0 55 2C 6A 1E
+ * Pico Tracker CORRECTED SNIFFER
+ * 1. MODE: Ble_2Mbit (Mode 4) - Fixed from dump
+ * 2. ENDIAN: Big Endian (PCNF1 bit 24 is set) - Fixed from dump
+ * 3. CRC: Disabled (To see data even if calculation fails)
  */
 
 #include <zephyr/kernel.h>
@@ -12,10 +10,11 @@
 #include <hal/nrf_radio.h>
 #include <zephyr/usb/usb_device.h>
 
-// === 根據 Dump 出來的鐵證 ===
-#define CH_FREQ           1           // 0x40001508 = 1
-#define TARGET_BASE_ADDR  0x552c6a1eUL // 0x4000151C
-#define TARGET_PREFIX     0xC0        // 0x40001524 (Byte 0)
+// === 參數設定 ===
+#define CH_FREQ           1           
+#define TARGET_BASE_ADDR  0x552c6a1eUL 
+#define TARGET_PREFIX     0xC0        
+#define RSSI_THRESHOLD    70          // -70dBm (放寬一點以免沒貼緊)
 
 static uint8_t rx_buffer[32]; 
 
@@ -25,40 +24,35 @@ void radio_init(void)
     k_busy_wait(200);
     NRF_RADIO->EVENTS_DISABLED = 0;
 
-    // 1. [致命修正] 設定為 BLE 2Mbit 模式 (值為 4)
-    // 之前用 Nrf_2Mbit (值為 1) 是收不到的！
-    NRF_RADIO->MODE = 4; // RADIO_MODE_MODE_Ble_2Mbit
+    // 1. [修正] 物理層模式 Ble_2Mbit (值為 4)
+    NRF_RADIO->MODE = 4; 
 
     NRF_RADIO->FREQUENCY = CH_FREQ;
 
     // 2. 地址設定
     NRF_RADIO->BASE0 = TARGET_BASE_ADDR;
     NRF_RADIO->PREFIX0 = TARGET_PREFIX;
-    NRF_RADIO->TXADDRESS = 0;      // Dump 顯示它用 Address 0 發射
-    NRF_RADIO->RXADDRESSES = 1;    // 啟用接收 Address 0
+    NRF_RADIO->TXADDRESS = 0;
+    NRF_RADIO->RXADDRESSES = 1;
 
-    // 3. [結構修正] 根據 0x40001514 = 00040008
-    // LFLEN = 8 (1 byte 長度欄位)
-    // S0LEN = 0
-    // S1LEN = 4 (4 bits 額外欄位)
+    // 3. PCNF0: 根據 Dump 設為 8 bit 長度
     NRF_RADIO->PCNF0 = (8 << RADIO_PCNF0_LFLEN_Pos) |
                        (0 << RADIO_PCNF0_S0LEN_Pos) |
-                       (4 << RADIO_PCNF0_S1LEN_Pos);
+                       (4 << RADIO_PCNF0_S1LEN_Pos); // S1LEN=4
 
-    // 4. PCNF1 根據 0x40001518 = 01040023
-    // MaxLen 35 (0x23), Balen 4, Endian Little
+    // 4. [關鍵修正] PCNF1: 設定為 BIG ENDIAN
+    // Dump 0x40001518 = 01040023 -> Bit 24 is 1
     NRF_RADIO->PCNF1 = (35 << RADIO_PCNF1_MAXLEN_Pos) | 
-                       (0  << RADIO_PCNF1_STATLEN_Pos) | // StatLen 0
+                       (0  << RADIO_PCNF1_STATLEN_Pos) | 
                        (4  << RADIO_PCNF1_BALEN_Pos) | 
-                       (RADIO_PCNF1_ENDIAN_Little << RADIO_PCNF1_ENDIAN_Pos);
+                       (1  << RADIO_PCNF1_ENDIAN_Pos); // 1 = Big Endian
 
-    // 5. CRC 設定 (標準)
-    NRF_RADIO->CRCCNF = (RADIO_CRCCNF_LEN_Two << RADIO_CRCCNF_LEN_Pos);
-    NRF_RADIO->CRCINIT = 0xFFFF;
-    NRF_RADIO->CRCPOLY = 0x11021;
+    // 5. 關閉 CRC (先看數據)
+    NRF_RADIO->CRCCNF = 0; 
     
-    // 6. 啟用捷徑
-    NRF_RADIO->SHORTS = RADIO_SHORTS_READY_START_Msk;
+    // 6. 啟用 RSSI 測量
+    NRF_RADIO->SHORTS = (RADIO_SHORTS_READY_START_Msk | 
+                         RADIO_SHORTS_ADDRESS_RSSISTART_Msk);
 }
 
 int main(void)
@@ -67,8 +61,8 @@ int main(void)
     k_sleep(K_MSEC(2000));
     
     printk("\n============================================\n");
-    printk(">>> CLONE RECEIVER STARTED               <<<\n");
-    printk(">>> MODE: Ble_2Mbit (Fix), LFLEN: 8 bits <<<\n");
+    printk(">>> CORRECTED SNIFFER (Mode 4 + BigEndian) <<<\n");
+    printk(">>> Showing raw data...                    <<<\n");
     printk("============================================\n");
 
     radio_init();
@@ -76,32 +70,27 @@ int main(void)
     NRF_RADIO->PACKETPTR = (uint32_t)rx_buffer;
     NRF_RADIO->TASKS_RXEN = 1;
     
-    int tick = 0;
-
     while (1) {
         if (NRF_RADIO->EVENTS_END) {
             NRF_RADIO->EVENTS_END = 0;
             
-            if (NRF_RADIO->CRCSTATUS == 1) {
-                printk("\n>>> [MATCH!] Received Valid Packet! <<<\n");
-                printk("Payload: ");
-                for(int i=0; i<16; i++) printk("%02X ", rx_buffer[i]);
-                printk("\n");
+            uint8_t rssi_val = NRF_RADIO->RSSISAMPLE;
+            
+            // RSSI 過濾
+            if (rssi_val > 0 && rssi_val <= RSSI_THRESHOLD) {
                 
-                // 收到後重啟
-                NRF_RADIO->TASKS_START = 1;
-            } else {
-                // 如果 CRC 錯，但有收到東西，也印一下驚嘆號，代表頻率/Mode對了
-                 // printk("!"); 
-                 NRF_RADIO->TASKS_START = 1;
-            }
-        }
+                // 過濾全 0
+                bool valid = false;
+                for(int i=0; i<8; i++) if (rx_buffer[i] != 0) valid = true;
 
-        tick++;
-        if (tick % 1000 == 0) {
-             // printk("."); // 心跳
+                if (valid) {
+                    printk("[RSSI -%d] RAW: ", rssi_val);
+                    for(int i=0; i<16; i++) printk("%02X ", rx_buffer[i]);
+                    printk("\n");
+                }
+            }
+            NRF_RADIO->TASKS_START = 1;
         }
-        
-        k_busy_wait(1000); 
+        k_busy_wait(100); 
     }
 }
