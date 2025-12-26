@@ -1,9 +1,9 @@
 /*
- * Pico Tracker ACTIVE PINGER
- * Strategy: 
- * 1. Configure Radio with confirmed settings (Mode 4, Big Endian).
- * 2. SEND a packet to address C0 55 2C 6A 1E.
- * 3. LISTEN for an ACK (which should contain IMU data).
+ * Pico Tracker HUNTER (Scanner & Responder)
+ * Strategy:
+ * 1. Listen (RX) on jumping channels.
+ * 2. If packet received from TARGET_ADDRESS -> Print it.
+ * 3. Immediately SEND an ACK (Empty PDU) to keep Tracker alive.
  */
 
 #include <zephyr/kernel.h>
@@ -11,127 +11,154 @@
 #include <hal/nrf_radio.h>
 #include <zephyr/usb/usb_device.h>
 
-// === 已確認的硬體參數 ===
-#define CH_FREQ           1
+// === 目標參數 ===
+// 根據 RAM Dump，它會跳頻，所以我們需要輪詢列表
+// 頻率列表: 2401(1), 2402(2), 2426(26), 2480(80), 2477(77)
+static const uint8_t scan_channels[] = {1, 2, 26, 80, 77, 25, 47};
+
+// 地址 (Big Endian 0xC0 55 2C 6A 1E)
 #define TARGET_BASE_ADDR  0x552c6a1eUL
 #define TARGET_PREFIX     0xC0
 
-static uint8_t tx_buffer[32]; // 發送緩衝區
-static uint8_t rx_buffer[32]; // 接收緩衝區
+// 接收與發送緩衝區
+static uint8_t rx_buffer[32];
+static uint8_t tx_buffer[32];
 
-void radio_configure(void)
+void radio_init(void)
 {
-    NRF_RADIO->TASKS_DISABLE = 1;
-    k_busy_wait(200);
-    NRF_RADIO->EVENTS_DISABLED = 0;
+    // 1. 重置 Radio
+    NRF_RADIO->POWER = 0;
+    k_busy_wait(500);
+    NRF_RADIO->POWER = 1;
 
-    // 1. [確認] 物理層 Mode 4 (Ble_2Mbit)
-    NRF_RADIO->MODE = 4; 
-    NRF_RADIO->FREQUENCY = CH_FREQ;
+    // 2. 物理層配置 (Ble_2Mbit)
+    NRF_RADIO->MODE = NRF_RADIO_MODE_BLE_2MBIT;
 
-    // 2. [確認] Big Endian + 正常地址長度
-    // 這次我們要發射，所以必須設對 BALEN，不能用盲收了
-    NRF_RADIO->PCNF0 = (8 << RADIO_PCNF0_LFLEN_Pos) |
-                       (0 << RADIO_PCNF0_S0LEN_Pos) |
-                       (4 << RADIO_PCNF0_S1LEN_Pos);
+    // 3. 封包格式配置 (關鍵修正!)
+    // 根據 dump 數據 "42 18 ...", 0x42 是 Header(S0), 0x18 是 Length
+    // 所以我們必須開啟 S0LEN=1, LFLEN=8
+    NRF_RADIO->PCNF0 = (8UL << RADIO_PCNF0_LFLEN_Pos) | 
+                       (1UL << RADIO_PCNF0_S0LEN_Pos) | 
+                       (0UL << RADIO_PCNF0_S1LEN_Pos); // S1 可能為 0 或 4，先設 0 試試
 
-    NRF_RADIO->PCNF1 = (32 << RADIO_PCNF1_MAXLEN_Pos) | 
-                       (0  << RADIO_PCNF1_STATLEN_Pos) | 
-                       (4  << RADIO_PCNF1_BALEN_Pos) | 
-                       (1  << RADIO_PCNF1_ENDIAN_Pos); // Big Endian
+    // PCNF1: Big Endian, MaxLen 32
+    NRF_RADIO->PCNF1 = (32UL << RADIO_PCNF1_MAXLEN_Pos) |
+                       (0UL  << RADIO_PCNF1_STATLEN_Pos) |
+                       (4UL  << RADIO_PCNF1_BALEN_Pos) |
+                       (1UL  << RADIO_PCNF1_ENDIAN_Pos) | // Big Endian
+                       (0UL  << RADIO_PCNF1_WHITEEN_Pos); // No Whitening
 
-    // 3. 設定地址
+    // 4. 地址配置
     NRF_RADIO->BASE0 = TARGET_BASE_ADDR;
     NRF_RADIO->PREFIX0 = TARGET_PREFIX;
-    
-    // TX 和 RX 都用 Address 0
-    NRF_RADIO->TXADDRESS = 0;
-    NRF_RADIO->RXADDRESSES = 1;
+    NRF_RADIO->TXADDRESS = 0;   // TX 使用邏輯地址 0
+    NRF_RADIO->RXADDRESSES = 1; // RX 監聽邏輯地址 0
 
-    // 4. CRC (Tracker 有開 CRC，我們也要開，不然它會拒收)
-    NRF_RADIO->CRCCNF = (RADIO_CRCCNF_LEN_Two << RADIO_CRCCNF_LEN_Pos);
+    // 5. CRC 配置 (16-bit, 0x1021)
+    NRF_RADIO->CRCCNF = (RADIO_CRCCNF_LEN_Two << RADIO_CRCCNF_LEN_Pos) | 
+                        (RADIO_CRCCNF_SKIPADDR_Skip << RADIO_CRCCNF_SKIPADDR_Pos);
     NRF_RADIO->CRCINIT = 0xFFFF;
     NRF_RADIO->CRCPOLY = 0x11021;
 
-    // 5. 設定捷徑：發射完 -> 自動轉接收 (等待 ACK)
-    // 這是 ESB 的標準操作：Ping -> Wait for Ack
-    NRF_RADIO->SHORTS = (RADIO_SHORTS_READY_START_Msk | 
-                         RADIO_SHORTS_END_DISABLE_Msk | 
-                         RADIO_SHORTS_DISABLED_RXEN_Msk); 
-                         // 注意：標準 ESB 是 TX->RX，這裡我們手動切換比較穩，先只用 Ready->Start
-    NRF_RADIO->SHORTS = RADIO_SHORTS_READY_START_Msk;
+    // 6. 快捷方式 (SHORTS) - 這是 "Active" 的關鍵
+    // 當接收到包 (END) -> 自動關閉 (DISABLE) -> 自動準備發送 (TXEN) -> 自動開始發送 (START)
+    // 這樣可以極速回覆 ACK
+    // *注意*：為了先 Debug，我們先不自動 TX，用軟體控制。等抓到包再開啟自動 ACK。
+    NRF_RADIO->SHORTS = (RADIO_SHORTS_READY_START_Msk | RADIO_SHORTS_END_DISABLE_Msk);
+}
+
+void prepare_response_packet(void)
+{
+    // 準備一個回應包 (ACK)
+    // 格式: [Header] [Length] [Payload...]
+    // 假設 Header = 0x01 (Empty PDU / ACK), Length = 0
+    tx_buffer[0] = 0x01; // S0 (Header)
+    tx_buffer[1] = 0x00; // Length = 0
+    // Payload 空
 }
 
 int main(void)
 {
     usb_enable(NULL);
-    k_sleep(K_MSEC(2000));
+    k_sleep(K_MSEC(3000)); // 等待 USB 連線
 
     printk("\n============================================\n");
-    printk(">>> ACTIVE PINGER STARTED                <<<\n");
-    printk(">>> Sending PING to C0 55 2C 6A 1E...    <<<\n");
+    printk(">>> Pico Tracker HUNTER (Scanner Mode)   <<<\n");
+    printk(">>> Searching for C0 55 2C 6A 1E...      <<<\n");
     printk("============================================\n");
 
-    radio_configure();
+    radio_init();
+    prepare_response_packet();
 
-    // 準備一個簡單的 Payload (空的，或者隨便填一點)
-    // 根據 LFLEN=8, S1LEN=4，我們需要填 Header
-    // 這裡我們模擬一個空的 Payload，長度為 0
-    tx_buffer[0] = 0; // Length = 0
-    tx_buffer[1] = 0; // S1 (padding)
+    int ch_idx = 0;
 
     while (1) {
-        // === 步驟 1: 發射 Ping ===
-        NRF_RADIO->EVENTS_END = 0;
-        NRF_RADIO->PACKETPTR = (uint32_t)tx_buffer;
-        
-        // 切換到 TX 模式
-        NRF_RADIO->TASKS_TXEN = 1;
-        
-        // 等待發射完成
-        while (NRF_RADIO->EVENTS_END == 0);
-        NRF_RADIO->EVENTS_END = 0;
-        
-        // 發射完，關閉 Radio (準備切換 RX)
-        NRF_RADIO->TASKS_DISABLE = 1;
-        while (NRF_RADIO->EVENTS_DISABLED == 0);
-        NRF_RADIO->EVENTS_DISABLED = 0;
+        // === 步驟 1: 設定頻率 ===
+        NRF_RADIO->FREQUENCY = scan_channels[ch_idx];
+        // printk("Scanning CH %d...\n", scan_channels[ch_idx]);
 
-        // printk("Ping sent... Listening for ACK...\n");
-
-        // === 步驟 2: 聽 ACK (聽 10ms) ===
+        // === 步驟 2: 進入 RX 模式 (監聽) ===
         NRF_RADIO->PACKETPTR = (uint32_t)rx_buffer;
+        NRF_RADIO->EVENTS_READY = 0;
         NRF_RADIO->TASKS_RXEN = 1;
-        
-        // 我們給它 5ms 的時間回應
-        bool ack_received = false;
-        for(int i=0; i<50; i++) {
+        while (NRF_RADIO->EVENTS_READY == 0); // 等待 Radio 啟動
+
+        // 啟動接收
+        NRF_RADIO->EVENTS_END = 0;
+        NRF_RADIO->TASKS_START = 1;
+
+        // === 步驟 3: 等待封包 (Timeout 機制) ===
+        // 給它 20ms 的時間窗口來抓包
+        bool packet_received = false;
+        for (volatile int i = 0; i < 15000; i++) {
             if (NRF_RADIO->EVENTS_END) {
-                NRF_RADIO->EVENTS_END = 0;
-                if (NRF_RADIO->CRCSTATUS == 1) {
-                    ack_received = true;
-                    break;
-                }
-                // 如果收到雜訊，繼續聽
-                NRF_RADIO->TASKS_START = 1;
+                packet_received = true;
+                break;
             }
-            k_busy_wait(100); // 0.1ms
         }
 
-        // === 結果判定 ===
-        if (ack_received) {
-            printk("\n>>> [ALIVE!] ACK RECEIVED from Tracker! <<<\n");
-            printk("Data: ");
-            for(int k=0; k<16; k++) printk("%02X ", rx_buffer[k]);
-            printk("\n");
+        // === 步驟 4: 處理結果 ===
+        if (packet_received) {
+            // 檢查 CRC
+            if (NRF_RADIO->CRCSTATUS == 1) {
+                // 檢查 Header 是否為 0x42 (Tracker 的廣播特徵)
+                // 這裡 rx_buffer[0] 是 S0, rx_buffer[1] 是 Length
+                
+                printk("\n>>> [CAPTURE!] Valid Packet on CH %d! <<<\n", scan_channels[ch_idx]);
+                printk("Header: %02X, Len: %02X, Payload: ", rx_buffer[0], rx_buffer[1]);
+                for(int k=0; k < (rx_buffer[1] > 10 ? 10 : rx_buffer[1]); k++) {
+                     printk("%02X ", rx_buffer[2+k]);
+                }
+                printk("\n");
+
+                // === 步驟 5: 立刻發送回應 (Keep-Alive) ===
+                // 因為我們用了 SHORTS_END_DISABLE，現在 Radio 已經 Disabled 了
+                // 我們立刻切換到 TX 發送回應
+                NRF_RADIO->PACKETPTR = (uint32_t)tx_buffer;
+                NRF_RADIO->EVENTS_END = 0;
+                NRF_RADIO->TASKS_TXEN = 1; // 觸發 TX
+                
+                // 等待 TX 完成
+                while (NRF_RADIO->EVENTS_END == 0);
+                
+                printk(">>> ACK Sent! (Try to bond)\n");
+                
+                // 鎖定這個頻道一小段時間，因為對話可能正在進行
+                k_sleep(K_MSEC(50)); 
+            } else {
+                // CRC 錯誤，可能是雜訊
+                // printk("CRC Error\n");
+            }
         } else {
-            // printk("."); // 沒回應
+            // Timeout，沒收到東西，強制關閉 Radio 準備換頻
+             NRF_RADIO->TASKS_DISABLE = 1;
+             while (NRF_RADIO->EVENTS_DISABLED == 0);
         }
 
-        // 關閉 Radio，休息一下再 Ping
-        NRF_RADIO->TASKS_DISABLE = 1;
-        while (NRF_RADIO->EVENTS_DISABLED == 0);
+        // 換下一個頻率
+        ch_idx = (ch_idx + 1) % sizeof(scan_channels);
         
-        k_sleep(K_MSEC(100)); // 每 100ms Ping 一次
+        // 極短暫延遲
+        // k_busy_wait(100); 
     }
 }
