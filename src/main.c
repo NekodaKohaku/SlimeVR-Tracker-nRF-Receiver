@@ -1,6 +1,6 @@
 /*
- * Pico Tracker HUNTER (DEBUG MODE)
- * 修正點：S1LEN=4, 開啟 CRC 錯誤顯示
+ * Pico Tracker HUNTER v3 (CRC FIX)
+ * 修正重點：CRCCNF SKIPADDR = 0 (必須包含地址！)
  */
 
 #include <zephyr/kernel.h>
@@ -8,12 +8,10 @@
 #include <hal/nrf_radio.h>
 #include <zephyr/usb/usb_device.h>
 
-static const uint8_t scan_channels[] = {1, 2, 26, 80, 77, 25, 47};
-
 #define TARGET_BASE_ADDR  0x552c6a1eUL
 #define TARGET_PREFIX     0xC0
 
-static uint8_t rx_buffer[32];
+static uint8_t rx_buffer[64];
 static uint8_t tx_buffer[32];
 
 void radio_init(void)
@@ -24,16 +22,15 @@ void radio_init(void)
 
     NRF_RADIO->MODE = NRF_RADIO_MODE_BLE_2MBIT;
 
-    // === 關鍵修正 ===
-    // S1LEN 必須設為 4 (bits)，否則 Payload 會錯位！
+    // S0=0, L=8, S1=4 (完全對齊 Tracker)
     NRF_RADIO->PCNF0 = (8UL << RADIO_PCNF0_LFLEN_Pos) | 
-                       (1UL << RADIO_PCNF0_S0LEN_Pos) | 
-                       (4UL << RADIO_PCNF0_S1LEN_Pos); // 修正這裡！
+                       (0UL << RADIO_PCNF0_S0LEN_Pos) | 
+                       (4UL << RADIO_PCNF0_S1LEN_Pos);
 
     NRF_RADIO->PCNF1 = (32UL << RADIO_PCNF1_MAXLEN_Pos) |
                        (0UL  << RADIO_PCNF1_STATLEN_Pos) |
                        (4UL  << RADIO_PCNF1_BALEN_Pos) |
-                       (1UL  << RADIO_PCNF1_ENDIAN_Pos) |
+                       (1UL  << RADIO_PCNF1_ENDIAN_Pos) | // Big Endian
                        (0UL  << RADIO_PCNF1_WHITEEN_Pos);
 
     NRF_RADIO->BASE0 = TARGET_BASE_ADDR;
@@ -41,28 +38,29 @@ void radio_init(void)
     NRF_RADIO->TXADDRESS = 0;
     NRF_RADIO->RXADDRESSES = 1;
 
+    // === 致命錯誤修正 ===
+    // Tracker 的 CRCCNF 是 0x02，代表 SKIPADDR=0 (Include Address)
+    // 我們之前設成了 Skip (1)，導致 CRC 永遠算錯！
     NRF_RADIO->CRCCNF = (RADIO_CRCCNF_LEN_Two << RADIO_CRCCNF_LEN_Pos) | 
-                        (RADIO_CRCCNF_SKIPADDR_Skip << RADIO_CRCCNF_SKIPADDR_Pos);
+                        (0UL << RADIO_CRCCNF_SKIPADDR_Pos); // 修正：包含地址！
+    
     NRF_RADIO->CRCINIT = 0xFFFF;
     NRF_RADIO->CRCPOLY = 0x11021;
 
-    // 暫時只用 RX，收到確認無誤後再開啟自動 TX
     NRF_RADIO->SHORTS = 0; 
 }
 
-void prepare_response_packet(void)
-{
-    tx_buffer[0] = 0x01; // Header
-    tx_buffer[1] = 0x00; // Length
-}
-
 void send_ack(void) {
+    // 準備一個簡單的空包作為 ACK
+    tx_buffer[0] = 0; // Length=0
+    tx_buffer[1] = 0; // S1=0
+    
     NRF_RADIO->SHORTS = (RADIO_SHORTS_READY_START_Msk | RADIO_SHORTS_END_DISABLE_Msk);
     NRF_RADIO->PACKETPTR = (uint32_t)tx_buffer;
     NRF_RADIO->EVENTS_END = 0;
     NRF_RADIO->TASKS_TXEN = 1;
     while (NRF_RADIO->EVENTS_END == 0);
-    NRF_RADIO->SHORTS = 0; // 重置 Shorts
+    NRF_RADIO->SHORTS = 0;
 }
 
 int main(void)
@@ -71,19 +69,17 @@ int main(void)
     k_sleep(K_MSEC(3000));
 
     printk("\n============================================\n");
-    printk(">>> HUNTER DEBUG MODE STARTED            <<<\n");
-    printk(">>> S1LEN=4, Show CRC Errors             <<<\n");
+    printk(">>> HUNTER v3 (CRC Address Fix)          <<<\n");
+    printk(">>> Scanning 0-80 MHz...                 <<<\n");
     printk("============================================\n");
 
     radio_init();
-    prepare_response_packet();
 
-    int ch_idx = 0;
+    int freq = 0;
 
     while (1) {
-        NRF_RADIO->FREQUENCY = scan_channels[ch_idx];
+        NRF_RADIO->FREQUENCY = freq;
         
-        // 進入 RX
         NRF_RADIO->PACKETPTR = (uint32_t)rx_buffer;
         NRF_RADIO->EVENTS_READY = 0;
         NRF_RADIO->TASKS_RXEN = 1;
@@ -92,49 +88,40 @@ int main(void)
         NRF_RADIO->EVENTS_END = 0;
         NRF_RADIO->TASKS_START = 1;
 
-        // 加長等待時間到 50ms (確保涵蓋一個廣播間隔)
-        bool packet_received = false;
-        for (volatile int i = 0; i < 40000; i++) {
+        // 掃描視窗 20ms
+        bool received = false;
+        for (volatile int i = 0; i < 20000; i++) {
             if (NRF_RADIO->EVENTS_END) {
-                packet_received = true;
+                received = true;
                 break;
             }
         }
 
-        if (packet_received) {
+        if (received) {
             if (NRF_RADIO->CRCSTATUS == 1) {
-                // === 成功抓到！ ===
-                printk("\n>>> [SUCCESS] CH %d | Header:%02X Len:%02X <<<\n", 
-                       scan_channels[ch_idx], rx_buffer[0], rx_buffer[1]);
+                // 抓到了！
+                printk("\n>>> [GOTCHA!] Freq %d MHz | Data: ", freq);
+                for(int k=0; k<12; k++) printk("%02X ", rx_buffer[k]);
+                printk("<<<\n");
+
+                // 立刻發送 ACK 喚醒它
+                NRF_RADIO->TASKS_DISABLE = 1;
+                while (NRF_RADIO->EVENTS_DISABLED == 0);
+                send_ack();
+                printk("ACK Sent! (Check Tracker LED)\n");
                 
-                // 嘗試印出 Payload
-                printk("Payload: ");
-                for(int k=0; k<8; k++) printk("%02X ", rx_buffer[2+k]);
-                printk("\n");
-
-                // 只有特徵符合才回 ACK
-                if (rx_buffer[0] == 0x42) {
-                    printk("Target Identified! Sending ACK...\n");
-                    NRF_RADIO->TASKS_DISABLE = 1;
-                    while (NRF_RADIO->EVENTS_DISABLED == 0);
-                    send_ack();
-                    k_sleep(K_MSEC(100)); // 讓它冷靜一下
-                }
-
+                k_sleep(K_MSEC(500)); // 暫停一下慶祝
             } else {
-                // === CRC 錯誤 (但地址匹配) ===
-                // 這代表我們已經「鎖定」了 Tracker，只是格式還有一點不對
-                printk("!"); // 印個驚嘆號代表有訊號
-                // printk("[CRC ERR] CH %d \n", scan_channels[ch_idx]); // 想看詳細可以取消註解
+                // 如果只出現 ! 但沒抓到，代表頻率對了但可能有干擾
+                // printk("!"); 
             }
-        } else {
-            // printk("."); // 沒訊號印個點
         }
 
-        // 強制關閉以換頻
+        // 換頻
         NRF_RADIO->TASKS_DISABLE = 1;
         while (NRF_RADIO->EVENTS_DISABLED == 0);
-
-        ch_idx = (ch_idx + 1) % sizeof(scan_channels);
+        
+        freq++;
+        if (freq > 80) freq = 0;
     }
 }
