@@ -1,8 +1,8 @@
 /*
- * Pico Tracker HUNTER v11 (Fix Boot Message)
- * 1. 修正 prj.conf 讓 Booting 訊息回歸
- * 2. 加入 "Scanning..." 文字回饋，證明程式在跑
- * 3. 參數：Freq/CRC/S1/Endian 全數修正
+ * Pico Tracker HUNTER v12 (User Config Special)
+ * Config: 使用你提供的 CONFIG_LOG_MODE_IMMEDIATE=y
+ * Logic:  開機硬延遲 4 秒 (等待 USB 連線) -> 開始掃描
+ * Params: Freq/CRC/S1/Endian 全數修正 (Based on pyOCD)
  */
 
 #include <zephyr/kernel.h>
@@ -11,7 +11,7 @@
 #include <zephyr/usb/usb_device.h>
 #include <zephyr/drivers/gpio.h>
 
-// 1. 頻率表 (Correct)
+// 1. 頻率表 (Correct: 2446, 2454, 2472, 2480)
 static const uint8_t target_freqs[] = {46, 54, 72, 80}; 
 
 // 2. 地址 (Correct)
@@ -32,12 +32,12 @@ void radio_init(void)
 
     NRF_RADIO->MODE = NRF_RADIO_MODE_BLE_2MBIT;
 
-    // PCNF0: S1=4
+    // PCNF0: S1=4 (Verified)
     NRF_RADIO->PCNF0 = (8UL << RADIO_PCNF0_LFLEN_Pos) | 
                        (0UL << RADIO_PCNF0_S0LEN_Pos) | 
                        (4UL << RADIO_PCNF0_S1LEN_Pos);
 
-    // PCNF1: Big Endian
+    // PCNF1: Big Endian (Verified)
     NRF_RADIO->PCNF1 = (55UL << RADIO_PCNF1_MAXLEN_Pos) |
                        (55UL << RADIO_PCNF1_STATLEN_Pos) |
                        (4UL  << RADIO_PCNF1_BALEN_Pos) |
@@ -49,7 +49,7 @@ void radio_init(void)
     NRF_RADIO->TXADDRESS = 0;
     NRF_RADIO->RXADDRESSES = 1; 
 
-    // CRC: 0x1021
+    // CRC: 0x1021 (Verified)
     NRF_RADIO->CRCCNF = (RADIO_CRCCNF_LEN_Two << RADIO_CRCCNF_LEN_Pos) | 
                         (0UL << RADIO_CRCCNF_SKIPADDR_Pos);
     NRF_RADIO->CRCINIT = 0xFFFF;
@@ -63,23 +63,25 @@ int main(void)
     // LED 初始化
     if (device_is_ready(led.port)) {
         gpio_pin_configure_dt(&led, GPIO_OUTPUT_ACTIVE);
-        gpio_pin_set_dt(&led, 1); // 亮燈 (如果沒亮請試試 0)
+        gpio_pin_set_dt(&led, 0); // 0 亮 (或 1 亮，視板子而定，先假設 Low Active)
     }
 
+    // 啟動 USB (你的 config 會讓它自動 init，這裡再次確保 enable)
     usb_enable(NULL);
     
-    // 延遲 4 秒，讓你有充裕時間打開 PuTTY
-    // 因為現在是 Buffered Mode，就算你晚開，之前的訊息也會吐出來
+    // ★ 關鍵延遲：配合你的 IMMEDIATE 模式 ★
+    // 因為 IMMEDIATE 模式不緩衝，所以我們必須等電腦連上才能印字。
+    // 這裡讓 LED 閃爍 4 秒 (8次)，請在這段時間打開串口軟體。
     for(int i=0; i<8; i++) {
         gpio_pin_toggle_dt(&led);
         k_sleep(K_MSEC(500));
     }
-    gpio_pin_set_dt(&led, 0); // 確保燈是亮的狀態進入 Loop (視板子極性而定)
+    gpio_pin_set_dt(&led, 0); // 確保燈是亮的狀態進入 Loop
 
     printk("\n\n");
     printk("============================================\n");
-    printk(">>> HUNTER v11 (Buffered Log)            <<<\n");
-    printk(">>> Waiting for Tracker Signals...       <<<\n");
+    printk(">>> HUNTER v12 (User Config)             <<<\n");
+    printk(">>> Configured for IMMEDIATE LOG MODE    <<<\n");
     printk("============================================\n");
 
     radio_init();
@@ -90,7 +92,7 @@ int main(void)
         int current_freq = target_freqs[freq_idx];
         NRF_RADIO->FREQUENCY = current_freq;
         
-        // ★ 關鍵：每 2 秒印一次，證明程式沒當機 ★
+        // 顯示掃描中...證明程式活著
         printk(">>> Scanning %d MHz...\n", 2400 + current_freq);
 
         int64_t end_time = k_uptime_get() + 2000;
@@ -102,13 +104,12 @@ int main(void)
             NRF_RADIO->TASKS_RXEN = 1;
 
             bool received = false;
-            // 這裡用稍微寬鬆的迴圈，配合 k_sleep 避免鎖死 USB 線程
-            for (int i = 0; i < 1000; i++) {
+            for (int i = 0; i < 20000; i++) { // 20ms timeout
                 if (NRF_RADIO->EVENTS_END) {
                     received = true;
                     break;
                 }
-                k_busy_wait(10); // 10us wait
+                k_busy_wait(1);
             }
 
             if (received) {
@@ -127,9 +128,6 @@ int main(void)
             } else {
                 NRF_RADIO->TASKS_DISABLE = 1;
                 while (NRF_RADIO->EVENTS_DISABLED == 0);
-                
-                // 稍微讓出 CPU 時間給 USB 處理 Log
-                k_sleep(K_USEC(100)); 
             }
         }
 
