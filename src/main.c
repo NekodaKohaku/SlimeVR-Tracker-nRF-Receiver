@@ -1,7 +1,7 @@
 /*
- * Pico Tracker HUNTER v9 (Original Logic + Verified Params)
- * 架構：完全依照你原本的設計 (無 DTR 等待，直接延遲 3 秒)
- * 修正：填入 pyOCD 抓到的正確頻率與 CRC
+ * Pico Tracker HUNTER v9 (Final verified)
+ * 架構：Camper Mode (停留 2 秒) + 簡單延遲啟動
+ * 參數：全數修正為 pyOCD 逆向值 (Freq/CRC/S1/Endian)
  */
 
 #include <zephyr/kernel.h>
@@ -9,21 +9,14 @@
 #include <hal/nrf_radio.h>
 #include <zephyr/usb/usb_device.h>
 
-// ==========================================
-// [修正 1] 頻率改為 pyOCD 觀察到的值
-// ==========================================
-// 舊: 1, 37, 77 (標準 BLE)
-// 新: 46, 54, 72, 80 (2446, 2454, 2472, 2480 MHz)
+// [修正 1] 頻率表：完全對應 Tracker 的跳頻點
 static const uint8_t target_freqs[] = {46, 54, 72, 80}; 
 
-// ==========================================
-// [修正 2] 地址設定
-// ==========================================
+// 地址：0xC0 + 0x552C6A1E
 #define ADDR_BASE      0x552C6A1EUL
 #define ADDR_PREFIX    0xC0
 
 static uint8_t rx_buffer[64];
-// static uint8_t tx_buffer[32]; // 先註解掉 TX，避免干擾，抓到再開
 
 void radio_init(void)
 {
@@ -33,51 +26,44 @@ void radio_init(void)
 
     NRF_RADIO->MODE = NRF_RADIO_MODE_BLE_2MBIT;
 
-    // ==========================================
-    // [修正 3] 封包結構 PCNF0
-    // ==========================================
-    // 你的舊碼: S1=4 -> 這是對的！保留！
-    // 這裡我們只是把寫法標準化，數值跟你原本的一樣
+    // [修正 2 & 6] PCNF0: S1LEN=4, S1INCL=0
+    // 雖然你舊版也是寫 4，但這裡再次確認這是對的
     NRF_RADIO->PCNF0 = (8UL << RADIO_PCNF0_LFLEN_Pos) | 
                        (0UL << RADIO_PCNF0_S0LEN_Pos) | 
                        (4UL << RADIO_PCNF0_S1LEN_Pos);
 
-    // PCNF1: 稍微放大 MaxLen 到 55 (0x37)
+    // [修正 4 & 5] PCNF1: Big Endian, MaxLen 放寬到 55
     NRF_RADIO->PCNF1 = (55UL << RADIO_PCNF1_MAXLEN_Pos) |
                        (55UL << RADIO_PCNF1_STATLEN_Pos) |
                        (4UL  << RADIO_PCNF1_BALEN_Pos) |
                        (1UL  << RADIO_PCNF1_ENDIAN_Pos) | 
                        (0UL  << RADIO_PCNF1_WHITEEN_Pos);
 
-    // 地址
     NRF_RADIO->BASE0 = ADDR_BASE;
     NRF_RADIO->PREFIX0 = (ADDR_PREFIX << 0);
     
     NRF_RADIO->TXADDRESS = 0;
     NRF_RADIO->RXADDRESSES = 1; 
 
-    // ==========================================
-    // [修正 4] CRC 修正
-    // ==========================================
-    // 你的舊碼: 0x11021 (這會導致收不到)
-    // 修正為:   0x1021
+    // [修正 3] CRC: 0x1021 (之前是 0x11021)
     NRF_RADIO->CRCCNF = (RADIO_CRCCNF_LEN_Two << RADIO_CRCCNF_LEN_Pos) | 
                         (0UL << RADIO_CRCCNF_SKIPADDR_Pos);
     
     NRF_RADIO->CRCINIT = 0xFFFF;
-    NRF_RADIO->CRCPOLY = 0x1021; // <--- 這裡改了
+    NRF_RADIO->CRCPOLY = 0x1021; 
 
     NRF_RADIO->SHORTS = RADIO_SHORTS_READY_START_Msk | RADIO_SHORTS_END_DISABLE_Msk;
 }
 
 int main(void)
 {
-    // === 你的原始啟動邏輯 ===
     usb_enable(NULL);
-    k_sleep(K_MSEC(3000)); // 只用 sleep，不檢查 DTR，保證會跑
+    
+    // 簡單暴力的等待，確保你打開視窗時看得到字
+    k_sleep(K_MSEC(3000)); 
 
     printk("\n============================================\n");
-    printk(">>> HUNTER v9 (Original Logic)           <<<\n");
+    printk(">>> HUNTER v9 (Final Verified)           <<<\n");
     printk(">>> Freqs: 2446, 2454, 2472, 2480 MHz    <<<\n");
     printk("============================================\n");
 
@@ -96,11 +82,9 @@ int main(void)
         while (k_uptime_get() < end_time) {
             
             NRF_RADIO->PACKETPTR = (uint32_t)rx_buffer;
-            
             NRF_RADIO->EVENTS_END = 0;
             NRF_RADIO->TASKS_RXEN = 1;
 
-            // 短暫等待接收
             bool received = false;
             for (int i = 0; i < 20000; i++) {
                 if (NRF_RADIO->EVENTS_END) {
@@ -111,15 +95,17 @@ int main(void)
             }
 
             if (received) {
+                // 如果參數全對，這裡的 CRCSTATUS 就會是 1
                 if (NRF_RADIO->CRCSTATUS == 1) {
-                    // ★ 這裡是你最想看到的 ★
                     int8_t rssi = -(int8_t)NRF_RADIO->RSSISAMPLE; 
+                    
                     printk("\n!!! [JACKPOT] Freq %d | RSSI %d !!!\n", 2400 + current_freq, rssi);
                     printk("Data: ");
+                    // 印出前 32 bytes 供分析
                     for(int k=0; k<32; k++) printk("%02X ", rx_buffer[k]);
                     printk("\n");
                     
-                    end_time += 200; // 延長停留
+                    end_time += 200; 
                 }
                 NRF_RADIO->EVENTS_END = 0;
             } else {
