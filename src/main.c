@@ -1,8 +1,8 @@
 /*
- * Pico Tracker HUNTER v13 (Dual Address Scan)
- * 策略：同時監聽 "正向" 與 "反向" 地址，解決 Endian 不確定性
- * Pipe 0: 0x552C6A1E (原本的)
- * Pipe 1: 0x1E6A2C55 (反轉的)
+ * Pico Tracker HUNTER v14 (Shotgun Mode)
+ * 策略：火力全開，同時監聽 8 種地址組合
+ * * Pipe 0~3: 使用 Base Normal (0x552C6A1E) + 4種前綴 (C0, 00, C3, 23)
+ * Pipe 4~7: 使用 Base Reversed (0x1E6A2C55) + 4種前綴 (C0, 00, C3, 23)
  */
 
 #include <zephyr/kernel.h>
@@ -14,10 +14,11 @@
 // 1. 頻率表
 static const uint8_t target_freqs[] = {46, 54, 72, 80}; 
 
-// 2. 地址定義 (兩種可能性)
+// 2. 地址原料 (來自 pyOCD)
 #define ADDR_BASE_NORMAL  0x552C6A1EUL
-#define ADDR_BASE_REV     0x1E6A2C55UL // Byte Swapped
-#define ADDR_PREFIX       0xC0
+#define ADDR_BASE_REV     0x1E6A2C55UL
+// 來自 0x40001524 的完整前綴資料: 23 C3 00 C0
+#define ALL_PREFIXES      0x23C300C0UL 
 
 // 3. LED
 #define LED0_NODE DT_ALIAS(led0)
@@ -45,16 +46,21 @@ void radio_init(void)
                        (1UL  << RADIO_PCNF1_ENDIAN_Pos) | 
                        (0UL  << RADIO_PCNF1_WHITEEN_Pos);
 
-    // === 設定雙地址 ===
-    // Pipe 0: 正向 (我們原本猜的)
-    NRF_RADIO->BASE0 = ADDR_BASE_NORMAL;
-    NRF_RADIO->PREFIX0 = (ADDR_PREFIX << 0) | (ADDR_PREFIX << 8); // Prefix Byte 0 & 1 都設 C0
-
-    // Pipe 1: 反向 (備案)
-    NRF_RADIO->BASE1 = ADDR_BASE_REV;
+    // === [關鍵] 8 通道全開 ===
     
-    // 啟用 Pipe 0 和 Pipe 1
-    NRF_RADIO->RXADDRESSES = 3; // Binary 0011 -> Enable Pipe 0 & 1
+    // Base 0 用於 Pipe 0~3 (正常順序)
+    NRF_RADIO->BASE0 = ADDR_BASE_NORMAL;
+    // Base 1 用於 Pipe 4~7 (反轉順序)
+    NRF_RADIO->BASE1 = ADDR_BASE_REV;
+
+    // 設定 Prefix (Pipe 0-3 共享 PREFIX0, Pipe 4-7 共享 PREFIX1)
+    // 我們把 pyOCD 讀到的 0x23C300C0 填入兩者
+    // 這樣 Pipe 0/4 會用 C0, Pipe 1/5 會用 00, Pipe 2/6 會用 C3, Pipe 3/7 會用 23
+    NRF_RADIO->PREFIX0 = ALL_PREFIXES;
+    NRF_RADIO->PREFIX1 = ALL_PREFIXES;
+
+    // 啟用全部 8 個通道 (Binary 11111111 = 0xFF)
+    NRF_RADIO->RXADDRESSES = 0xFF;
 
     // CRC
     NRF_RADIO->CRCCNF = (RADIO_CRCCNF_LEN_Two << RADIO_CRCCNF_LEN_Pos) | 
@@ -74,7 +80,7 @@ int main(void)
 
     usb_enable(NULL);
     
-    // 延遲啟動，確保你看得到 Log
+    // 延遲啟動
     for(int i=0; i<8; i++) {
         gpio_pin_toggle_dt(&led);
         k_sleep(K_MSEC(500));
@@ -83,9 +89,8 @@ int main(void)
 
     printk("\n\n");
     printk("============================================\n");
-    printk(">>> HUNTER v13 (Dual Address Mode)       <<<\n");
-    printk(">>> Listening on Pipe 0 (Normal)         <<<\n");
-    printk(">>> Listening on Pipe 1 (Reversed)       <<<\n");
+    printk(">>> HUNTER v14 (Shotgun Mode)            <<<\n");
+    printk(">>> Scanning ALL 8 Address Combinations  <<<\n");
     printk("============================================\n");
 
     radio_init();
@@ -120,8 +125,10 @@ int main(void)
                     gpio_pin_toggle_dt(&led);
 
                     // 檢查是哪個 Pipe 抓到的
-                    int pipe = 0;
-                    if (NRF_RADIO->RXMATCH == 1) pipe = 1;
+                    int pipe = -1;
+                    if (NRF_RADIO->RXMATCH <= 7) {
+                        pipe = NRF_RADIO->RXMATCH;
+                    }
 
                     int8_t rssi = -(int8_t)NRF_RADIO->RSSISAMPLE; 
                     
@@ -130,6 +137,7 @@ int main(void)
                     for(int k=0; k<32; k++) printk("%02X ", rx_buffer[k]);
                     printk("\n");
                     
+                    // 抓到了就多聽一下
                     end_time += 200; 
                 }
                 NRF_RADIO->EVENTS_END = 0;
