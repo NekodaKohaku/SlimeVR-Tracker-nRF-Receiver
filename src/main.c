@@ -1,7 +1,9 @@
 /*
- * Pico Tracker HUNTER v15 (RSSI Analyzer)
- * 診斷模式：不解碼，只看有沒有「能量」
- * 用途：確認 Tracker 到底在不在這些頻率上？
+ * Pico Tracker HUNTER v17 (Live Data Sync)
+ * 根據 pyOCD 現場讀數修正：
+ * 1. 頻率：改為低頻段 (0, 3, 9 MHz)
+ * 2. 地址：啟用 Pipe 2-5，並加入新發現的 BASE1
+ * 3. 策略：攔截握手封包
  */
 
 #include <zephyr/kernel.h>
@@ -10,12 +12,19 @@
 #include <zephyr/usb/usb_device.h>
 #include <zephyr/drivers/gpio.h>
 
-// 1. 懷疑的頻率
-static const uint8_t target_freqs[] = {46, 54, 72, 80}; 
+// === [修正 1] 根據 read32 0x40001550 看到的頻率 ===
+static const uint8_t target_freqs[] = {0, 3, 9}; // 2400, 2403, 2409 MHz
 
-// 2. LED
+// === [修正 2] 根據 read32 得到的地址參數 ===
+#define ADDR_BASE_0       0x552C6A1EUL // Pipe 2, 3 用這個
+#define ADDR_BASE_1       0xD235CF35UL // Pipe 4, 5 用這個 (新發現!)
+#define PREFIXES_ALL      0x23C300C0UL // 來自 0x40001524
+
+// LED
 #define LED0_NODE DT_ALIAS(led0)
 static const struct gpio_dt_spec led = GPIO_DT_SPEC_GET(LED0_NODE, gpios);
+
+static uint8_t rx_buffer[64];
 
 void radio_init(void)
 {
@@ -23,16 +32,41 @@ void radio_init(void)
     k_busy_wait(500);
     NRF_RADIO->POWER = 1;
 
-    NRF_RADIO->MODE = NRF_RADIO_MODE_BLE_2MBIT;
-    
-    // 即使只是測 RSSI，基本的 Radio 啟用也需要設定
-    // 隨便設個地址，反正我們不等 Packet，我們只看能量
-    NRF_RADIO->BASE0 = 0x552C6A1E;
-    NRF_RADIO->PREFIX0 = 0xC0;
-    NRF_RADIO->RXADDRESSES = 1; 
+    NRF_RADIO->MODE = NRF_RADIO_MODE_BLE_2MBIT; // 0x04 確認無誤
 
-    // 捷徑：RSSI 測量完自動停止
-    NRF_RADIO->SHORTS = RADIO_SHORTS_READY_START_Msk; 
+    // PCNF0: S1=4 (Verified)
+    NRF_RADIO->PCNF0 = (8UL << RADIO_PCNF0_LFLEN_Pos) | 
+                       (0UL << RADIO_PCNF0_S0LEN_Pos) | 
+                       (4UL << RADIO_PCNF0_S1LEN_Pos);
+
+    // PCNF1: Big Endian (Verified)
+    NRF_RADIO->PCNF1 = (55UL << RADIO_PCNF1_MAXLEN_Pos) |
+                       (55UL << RADIO_PCNF1_STATLEN_Pos) |
+                       (4UL  << RADIO_PCNF1_BALEN_Pos) |
+                       (1UL  << RADIO_PCNF1_ENDIAN_Pos) | 
+                       (0UL  << RADIO_PCNF1_WHITEEN_Pos);
+
+    // === [修正 3] 地址設定 (根據 RXADDRESSES=0xFC) ===
+    NRF_RADIO->BASE0 = ADDR_BASE_0;
+    NRF_RADIO->BASE1 = ADDR_BASE_1;
+
+    // 設定前綴
+    NRF_RADIO->PREFIX0 = PREFIXES_ALL;
+    NRF_RADIO->PREFIX1 = PREFIXES_ALL;
+
+    // 啟用 Pipe 2, 3, 4, 5, 6, 7 (0xFC)
+    // 這樣我們會監聽:
+    // Pipe 2: 00 + 552C6A1E
+    // Pipe 4: C0 + D235CF35 (這個嫌疑最大!)
+    NRF_RADIO->RXADDRESSES = 0xFC; 
+
+    // CRC
+    NRF_RADIO->CRCCNF = (RADIO_CRCCNF_LEN_Two << RADIO_CRCCNF_LEN_Pos) | 
+                        (0UL << RADIO_CRCCNF_SKIPADDR_Pos);
+    NRF_RADIO->CRCINIT = 0xFFFF;
+    NRF_RADIO->CRCPOLY = 0x1021; 
+
+    NRF_RADIO->SHORTS = RADIO_SHORTS_READY_START_Msk | RADIO_SHORTS_END_DISABLE_Msk;
 }
 
 int main(void)
@@ -45,7 +79,7 @@ int main(void)
     usb_enable(NULL);
     
     // 延遲啟動
-    for(int i=0; i<6; i++) {
+    for(int i=0; i<8; i++) {
         gpio_pin_toggle_dt(&led);
         k_sleep(K_MSEC(500));
     }
@@ -53,9 +87,9 @@ int main(void)
 
     printk("\n\n");
     printk("============================================\n");
-    printk(">>> HUNTER v15 (Signal Analyzer)         <<<\n");
-    printk(">>> Testing Signal Strength (RSSI)       <<<\n");
-    printk(">>> Put Tracker VERY CLOSE to Dongle!    <<<\n");
+    printk(">>> HUNTER v17 (Handshake Hunter)        <<<\n");
+    printk(">>> Freqs: 2400, 2403, 2409 MHz          <<<\n");
+    printk(">>> Targets: Pipe 2-7 (BASE 0 & 1)       <<<\n");
     printk("============================================\n");
 
     radio_init();
@@ -66,46 +100,49 @@ int main(void)
         int current_freq = target_freqs[freq_idx];
         NRF_RADIO->FREQUENCY = current_freq;
         
-        // 啟動接收
-        NRF_RADIO->EVENTS_READY = 0;
-        NRF_RADIO->TASKS_RXEN = 1;
-        while (NRF_RADIO->EVENTS_READY == 0); // 等待 Radio 暖機完成
+        printk(">>> Scanning %d MHz...\n", 2400 + current_freq);
 
-        // 啟動 RSSI 採樣
-        NRF_RADIO->EVENTS_RSSIEND = 0;
-        NRF_RADIO->TASKS_RSSISTART = 1;
-        
-        // 等待採樣完成
-        while (NRF_RADIO->EVENTS_RSSIEND == 0);
+        int64_t end_time = k_uptime_get() + 1500; // 掃描快一點
 
-        // 讀取 RSSI (數值是負的 dBm)
-        int8_t rssi = -(int8_t)NRF_RADIO->RSSISAMPLE;
+        while (k_uptime_get() < end_time) {
+            
+            NRF_RADIO->PACKETPTR = (uint32_t)rx_buffer;
+            NRF_RADIO->EVENTS_END = 0;
+            NRF_RADIO->TASKS_RXEN = 1;
 
-        // 關閉 Radio (省電並重置狀態)
-        NRF_RADIO->TASKS_DISABLE = 1;
-        while (NRF_RADIO->EVENTS_DISABLED == 0);
+            bool received = false;
+            for (int i = 0; i < 20000; i++) { 
+                if (NRF_RADIO->EVENTS_END) {
+                    received = true;
+                    break;
+                }
+                k_busy_wait(1);
+            }
 
-        // ★ 判斷訊號強度 ★
-        // 一般雜訊大約在 -90 到 -100 dBm
-        // 如果 Tracker 在旁邊，訊號應該要在 -60 dBm 以上 (數字越大越強，例如 -40)
-        
-        if (rssi > -70) { 
-            // 訊號強！這裡有東西！
-            gpio_pin_toggle_dt(&led);
-            printk(">>> [FOUND] Freq %d MHz | Signal: %d dBm (STRONG!)\n", 2400 + current_freq, rssi);
-        } else {
-            // 沒訊號，印個點就好
-            // printk("."); 
+            if (received) {
+                if (NRF_RADIO->CRCSTATUS == 1) {
+                    gpio_pin_toggle_dt(&led);
+
+                    int pipe = NRF_RADIO->RXMATCH; // 看是哪個 Pipe 抓到的
+                    int8_t rssi = -(int8_t)NRF_RADIO->RSSISAMPLE; 
+                    
+                    printk("\n!!! [JACKPOT] Pipe %d | Freq %d | RSSI %d !!!\n", pipe, 2400 + current_freq, rssi);
+                    printk("Data: ");
+                    for(int k=0; k<32; k++) printk("%02X ", rx_buffer[k]);
+                    printk("\n");
+                    
+                    end_time += 100; 
+                }
+                NRF_RADIO->EVENTS_END = 0;
+            } else {
+                NRF_RADIO->TASKS_DISABLE = 1;
+                while (NRF_RADIO->EVENTS_DISABLED == 0);
+            }
         }
-
-        // 稍微延遲，換下一個頻率
-        k_sleep(K_MSEC(10)); // 快速掃描
 
         freq_idx++;
         if (freq_idx >= sizeof(target_freqs) / sizeof(target_freqs[0])) {
             freq_idx = 0;
-            // 掃完一輪如果都沒訊號，印一行分隔線
-            // printk("\n");
         }
     }
 }
