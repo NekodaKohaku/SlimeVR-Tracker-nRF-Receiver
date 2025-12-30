@@ -1,9 +1,7 @@
 /*
- * Pico Tracker HUNTER v18 (The Dragnet)
- * 終極整合版：
- * 1. 頻率：掃描所有已知點 {0, 3, 9, 46, 54, 72, 80}
- * 2. 地址：啟用 Pipe 0-7 (Base0 + Base1 + All Prefixes)
- * 3. 目標：不管它是握手還是傳輸，全部攔截
+ * Pico Tracker HUNTER v19 (Promiscuous CRC)
+ * 策略：移除 CRC 過濾器
+ * 目的：檢查是否收到 "地址正確" 但 "CRC 錯誤" 的封包？
  */
 
 #include <zephyr/kernel.h>
@@ -12,14 +10,13 @@
 #include <zephyr/usb/usb_device.h>
 #include <zephyr/drivers/gpio.h>
 
-// === [關鍵] 頻率全列表 ===
-// 0,3,9 (握手/低頻) + 46,54,72,80 (數據/高頻)
+// 頻率表 (涵蓋握手與數據)
 static const uint8_t target_freqs[] = {0, 3, 9, 46, 54, 72, 80};
 
-// === 地址參數 (來自 pyOCD) ===
+// 地址參數
 #define ADDR_BASE_0       0x552C6A1EUL 
 #define ADDR_BASE_1       0xD235CF35UL
-#define PREFIXES_ALL      0x23C300C0UL // Byte 0=C0, 1=00, 2=C3, 3=23
+#define PREFIXES_ALL      0x23C300C0UL
 
 // LED
 #define LED0_NODE DT_ALIAS(led0)
@@ -35,31 +32,25 @@ void radio_init(void)
 
     NRF_RADIO->MODE = NRF_RADIO_MODE_BLE_2MBIT; // 0x04
 
-    // PCNF0: S1=4
     NRF_RADIO->PCNF0 = (8UL << RADIO_PCNF0_LFLEN_Pos) | 
                        (0UL << RADIO_PCNF0_S0LEN_Pos) | 
                        (4UL << RADIO_PCNF0_S1LEN_Pos);
 
-    // PCNF1: Big Endian
     NRF_RADIO->PCNF1 = (55UL << RADIO_PCNF1_MAXLEN_Pos) |
                        (55UL << RADIO_PCNF1_STATLEN_Pos) |
                        (4UL  << RADIO_PCNF1_BALEN_Pos) |
                        (1UL  << RADIO_PCNF1_ENDIAN_Pos) | 
                        (0UL  << RADIO_PCNF1_WHITEEN_Pos);
 
-    // === 地址全開 ===
-    NRF_RADIO->BASE0 = ADDR_BASE_0; // Pipe 0-3 用這個
-    NRF_RADIO->BASE1 = ADDR_BASE_1; // Pipe 4-7 用這個
+    NRF_RADIO->BASE0 = ADDR_BASE_0; 
+    NRF_RADIO->BASE1 = ADDR_BASE_1; 
 
-    // 設定 Prefix (Pipe 0-3 和 4-7 共用這組前綴)
-    // Pipe 0/4 -> C0, Pipe 1/5 -> 00, Pipe 2/6 -> C3, Pipe 3/7 -> 23
     NRF_RADIO->PREFIX0 = PREFIXES_ALL;
     NRF_RADIO->PREFIX1 = PREFIXES_ALL;
 
-    // 啟用全部 8 個通道
-    NRF_RADIO->RXADDRESSES = 0xFF; 
+    NRF_RADIO->RXADDRESSES = 0xFF; // 8 管全開
 
-    // CRC
+    // CRC 設定 (即使我們忽略結果，硬體還是需要設定)
     NRF_RADIO->CRCCNF = (RADIO_CRCCNF_LEN_Two << RADIO_CRCCNF_LEN_Pos) | 
                         (0UL << RADIO_CRCCNF_SKIPADDR_Pos);
     NRF_RADIO->CRCINIT = 0xFFFF;
@@ -86,8 +77,8 @@ int main(void)
 
     printk("\n\n");
     printk("============================================\n");
-    printk(">>> HUNTER v18 (The Dragnet)             <<<\n");
-    printk(">>> Scanning 7 Freqs x 8 Address Pipes   <<<\n");
+    printk(">>> HUNTER v19 (Garbage Collector)       <<<\n");
+    printk(">>> Reporting ALL MATCHES (Even Bad CRC) <<<\n");
     printk("============================================\n");
 
     radio_init();
@@ -98,9 +89,8 @@ int main(void)
         int current_freq = target_freqs[freq_idx];
         NRF_RADIO->FREQUENCY = current_freq;
         
-        printk(">>> Scanning %d MHz... (Pipe 0-7)\n", 2400 + current_freq);
+        printk(">>> Scanning %d MHz...\n", 2400 + current_freq);
 
-        // 每個頻率停留 500ms (太短怕錯過，太長怕頻率不對)
         int64_t end_time = k_uptime_get() + 500;
 
         while (k_uptime_get() < end_time) {
@@ -110,7 +100,6 @@ int main(void)
             NRF_RADIO->TASKS_RXEN = 1;
 
             bool received = false;
-            // 縮短單次等待時間，增加反應速度
             for (int i = 0; i < 10000; i++) { 
                 if (NRF_RADIO->EVENTS_END) {
                     received = true;
@@ -120,20 +109,29 @@ int main(void)
             }
 
             if (received) {
-                if (NRF_RADIO->CRCSTATUS == 1) {
-                    gpio_pin_toggle_dt(&led);
+                // ★ 關鍵修改：移除了 if (CRCSTATUS == 1) 的限制 ★
+                
+                int pipe = NRF_RADIO->RXMATCH;
+                int8_t rssi = -(int8_t)NRF_RADIO->RSSISAMPLE; 
+                bool crc_ok = (NRF_RADIO->CRCSTATUS == 1);
 
-                    int pipe = NRF_RADIO->RXMATCH; // 這是關鍵！看它是哪個 Pipe 進來的
-                    int8_t rssi = -(int8_t)NRF_RADIO->RSSISAMPLE; 
+                // 只有當訊號強度還不錯時才印出來 (過濾純雜訊)
+                // -90 dBm 以下通常是太遠或背景雜訊
+                if (rssi > -90) {
+                    gpio_pin_toggle_dt(&led);
                     
-                    printk("\n!!! [JACKPOT] Pipe %d | Freq %d | RSSI %d !!!\n", pipe, 2400 + current_freq, rssi);
+                    if (crc_ok) {
+                        printk("\n!!! [JACKPOT] Pipe %d | Freq %d | RSSI %d | CRC: OK !!!\n", pipe, 2400 + current_freq, rssi);
+                    } else {
+                        // 這是我們想找的：地址對了，但 CRC 失敗！
+                        printk("\n?? [BAD CRC] Pipe %d | Freq %d | RSSI %d | CRC: FAIL ??\n", pipe, 2400 + current_freq, rssi);
+                    }
+
                     printk("Data: ");
                     for(int k=0; k<32; k++) printk("%02X ", rx_buffer[k]);
                     printk("\n");
-                    
-                    // 抓到了！延長停留時間，看看是不是連續數據
-                    end_time += 500; 
                 }
+                
                 NRF_RADIO->EVENTS_END = 0;
             } else {
                 NRF_RADIO->TASKS_DISABLE = 1;
