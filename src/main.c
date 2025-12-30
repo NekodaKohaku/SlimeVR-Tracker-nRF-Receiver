@@ -1,10 +1,3 @@
-/*
- * Pico Tracker HUNTER v28 (High-Band Trawl)
- * 策略：不再追逐單一頻率，而是覆蓋整個 "高頻段" 活躍區
- * 範圍：2458 MHz ~ 2480 MHz (每 2MHz 一跳) + 2442 (同步用)
- * 參數：Pipe 1 Only, No CRC
- */
-
 #include <zephyr/kernel.h>
 #include <zephyr/sys/printk.h>
 #include <hal/nrf_radio.h>
@@ -42,7 +35,7 @@ void radio_init(void)
                        (4UL << RADIO_PCNF0_S1LEN_Pos);
 
     // PCNF1
-    NRF_RADIO->PCNF1 = (32UL << RADIO_PCNF1_MAXLEN_Pos) | 
+    NRF_RADIO->PCNF1 = (60UL << RADIO_PCNF1_MAXLEN_Pos) | 
                        (32UL << RADIO_PCNF1_STATLEN_Pos) |
                        (4UL  << RADIO_PCNF1_BALEN_Pos) |
                        (1UL  << RADIO_PCNF1_ENDIAN_Pos) | 
