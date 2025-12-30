@@ -1,8 +1,8 @@
 /*
- * Pico Tracker HUNTER v26 (Sync Frequencies)
- * 根據最新 pyOCD 快照修正：
- * 1. 頻率表更新：加入 60, 64, 70, 76 (2460-2476 MHz)
- * 2. 參數鎖定：Pipe 1 Only (Prefix 00), No CRC
+ * Pico Tracker HUNTER v28 (High-Band Trawl)
+ * 策略：不再追逐單一頻率，而是覆蓋整個 "高頻段" 活躍區
+ * 範圍：2458 MHz ~ 2480 MHz (每 2MHz 一跳) + 2442 (同步用)
+ * 參數：Pipe 1 Only, No CRC
  */
 
 #include <zephyr/kernel.h>
@@ -11,14 +11,16 @@
 #include <zephyr/usb/usb_device.h>
 #include <zephyr/drivers/gpio.h>
 
-// ★★★ 關鍵更新：根據你剛剛讀到的頻率 ★★★
-// 60(2460), 64(2464), 70(2470), 76(2476)
-// 保留幾個舊的以防萬一，但重點放在新的
-static const uint8_t target_freqs[] = {60, 64, 70, 76, 0, 3, 9};
+// ★★★ 頻率大補帖：覆蓋所有可能的高頻點 ★★★
+// 包含你兩次測試看到的所有點，以及中間的空隙
+static const uint8_t target_freqs[] = {
+    58, 60, 62, 64, 66, 68, 70, 72, 74, 76, 78, 80, // 高頻密集區
+    42, 3, 9 // 低頻/同步區 (備用)
+};
 
-// 地址參數 (鎖定 Pipe 1)
+// 地址參數：鎖定 Pipe 1 (00 + D235CF35)
 #define ADDR_BASE_1       0xD235CF35UL 
-#define ADDR_PREFIX_0     0x23C300C0UL // Byte 1 = 00 (Pipe 1)
+#define ADDR_PREFIX_0     0x23C300C0UL // Byte 1 = 00
 
 // LED
 #define LED0_NODE DT_ALIAS(led0)
@@ -39,7 +41,7 @@ void radio_init(void)
                        (0UL << RADIO_PCNF0_S0LEN_Pos) | 
                        (4UL << RADIO_PCNF0_S1LEN_Pos);
 
-    // PCNF1: Big Endian, Balen=4, MaxLen=32
+    // PCNF1
     NRF_RADIO->PCNF1 = (32UL << RADIO_PCNF1_MAXLEN_Pos) | 
                        (32UL << RADIO_PCNF1_STATLEN_Pos) |
                        (4UL  << RADIO_PCNF1_BALEN_Pos) |
@@ -50,10 +52,10 @@ void radio_init(void)
     NRF_RADIO->BASE1 = ADDR_BASE_1; 
     NRF_RADIO->PREFIX0 = ADDR_PREFIX_0;
 
-    // 只啟用 Pipe 1 (對應 Prefix0 的 Byte 1 -> 00)
-    NRF_RADIO->RXADDRESSES = 0x02; 
+    // 啟用 Pipe 1 (以及其他以防萬一)
+    NRF_RADIO->RXADDRESSES = 0xFE; 
 
-    // ★ CRC 關閉 ★
+    // ★ CRC 保持關閉 ★
     NRF_RADIO->CRCCNF = 0; 
 
     NRF_RADIO->SHORTS = RADIO_SHORTS_READY_START_Msk | RADIO_SHORTS_END_DISABLE_Msk;
@@ -77,8 +79,8 @@ int main(void)
 
     printk("\n\n");
     printk("============================================\n");
-    printk(">>> HUNTER v26 (Freq Sync)               <<<\n");
-    printk(">>> Target: 2460/64/70/76 MHz            <<<\n");
+    printk(">>> HUNTER v28 (High-Band Trawl)         <<<\n");
+    printk(">>> Scanning 2458-2480 MHz (Adaptive)    <<<\n");
     printk("============================================\n");
 
     radio_init();
@@ -89,9 +91,10 @@ int main(void)
         int current_freq = target_freqs[freq_idx];
         NRF_RADIO->FREQUENCY = current_freq;
         
-        printk(">>> Scanning %d MHz...\n", 2400 + current_freq);
+        // 為了減少 Log 刷屏，我們這裡不印 Scanning... 
+        // 除非你想要看到它在切換
 
-        int64_t end_time = k_uptime_get() + 300; // 掃快一點，跟上跳頻
+        int64_t end_time = k_uptime_get() + 200; // 每個頻率停留 0.2 秒，快速輪詢
 
         while (k_uptime_get() < end_time) {
             
@@ -100,7 +103,7 @@ int main(void)
             NRF_RADIO->TASKS_RXEN = 1;
 
             bool received = false;
-            for (int i = 0; i < 10000; i++) { 
+            for (int i = 0; i < 5000; i++) { 
                 if (NRF_RADIO->EVENTS_END) {
                     received = true;
                     break;
@@ -109,19 +112,19 @@ int main(void)
             }
 
             if (received) {
-                // 抓到數據！
-                gpio_pin_toggle_dt(&led);
                 int8_t rssi = -(int8_t)NRF_RADIO->RSSISAMPLE; 
                 
-                // 只要有訊號就印，因為我們沒開 CRC
+                // 只有訊號夠強才印，避免雜訊
                 if (rssi > -90) {
+                    gpio_pin_toggle_dt(&led);
                     printk("\n!!! [JACKPOT] Freq %d | RSSI %d !!!\n", 2400 + current_freq, rssi);
                     printk("Data: ");
                     for(int k=0; k<32; k++) printk("%02X ", rx_buffer[k]);
                     printk("\n");
                     
-                    // 稍微延長停留，看能不能抓連續包
-                    end_time += 200; 
+                    // ★ 關鍵：一旦抓到了，就死咬著這個頻率久一點 ★
+                    // 因為 Tracker 會在這個頻率停留一陣子
+                    end_time += 1000; 
                 }
                 NRF_RADIO->EVENTS_END = 0;
             } else {
