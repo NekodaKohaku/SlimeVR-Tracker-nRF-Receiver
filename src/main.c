@@ -1,7 +1,8 @@
 /*
- * Pico Tracker HUNTER v24 (Trust The Address)
- * 策略：使用正確的地址 (BASE1 + PREFIX1)，但 "關閉 CRC"
- * 原因：v23 失敗意味著 CRC 參數不對，我們繞過它直接抓 raw data
+ * Pico Tracker HUNTER v26 (Sync Frequencies)
+ * 根據最新 pyOCD 快照修正：
+ * 1. 頻率表更新：加入 60, 64, 70, 76 (2460-2476 MHz)
+ * 2. 參數鎖定：Pipe 1 Only (Prefix 00), No CRC
  */
 
 #include <zephyr/kernel.h>
@@ -10,12 +11,14 @@
 #include <zephyr/usb/usb_device.h>
 #include <zephyr/drivers/gpio.h>
 
-// 掃描全頻段
-static const uint8_t target_freqs[] = {0, 3, 9, 46, 54, 72, 80};
+// ★★★ 關鍵更新：根據你剛剛讀到的頻率 ★★★
+// 60(2460), 64(2464), 70(2470), 76(2476)
+// 保留幾個舊的以防萬一，但重點放在新的
+static const uint8_t target_freqs[] = {60, 64, 70, 76, 0, 3, 9};
 
-// === 確定的地址參數 (這是我們最大的資產) ===
+// 地址參數 (鎖定 Pipe 1)
 #define ADDR_BASE_1       0xD235CF35UL 
-#define ADDR_PREFIX_1     0x13E363A3UL // Pipe 4-7
+#define ADDR_PREFIX_0     0x23C300C0UL // Byte 1 = 00 (Pipe 1)
 
 // LED
 #define LED0_NODE DT_ALIAS(led0)
@@ -37,21 +40,20 @@ void radio_init(void)
                        (4UL << RADIO_PCNF0_S1LEN_Pos);
 
     // PCNF1: Big Endian, Balen=4, MaxLen=32
-    NRF_RADIO->PCNF1 = (32UL << RADIO_PCNF1_MAXLEN_Pos) | // 限制長度，避免錯亂
+    NRF_RADIO->PCNF1 = (32UL << RADIO_PCNF1_MAXLEN_Pos) | 
                        (32UL << RADIO_PCNF1_STATLEN_Pos) |
                        (4UL  << RADIO_PCNF1_BALEN_Pos) |
                        (1UL  << RADIO_PCNF1_ENDIAN_Pos) | 
                        (0UL  << RADIO_PCNF1_WHITEEN_Pos);
 
-    // 設定地址 (只設我們最有把握的 BASE1)
+    // 地址設定
     NRF_RADIO->BASE1 = ADDR_BASE_1; 
-    NRF_RADIO->PREFIX1 = ADDR_PREFIX_1;
+    NRF_RADIO->PREFIX0 = ADDR_PREFIX_0;
 
-    // 只開啟 Pipe 4, 5, 6, 7 (這是 BASE1/PREFIX1 的管轄範圍)
-    NRF_RADIO->RXADDRESSES = 0xF0; 
+    // 只啟用 Pipe 1 (對應 Prefix0 的 Byte 1 -> 00)
+    NRF_RADIO->RXADDRESSES = 0x02; 
 
-    // ★★★ 關鍵修改：關閉 CRC ★★★
-    // 這樣硬體就不會因為 CRC 算錯而丟掉封包
+    // ★ CRC 關閉 ★
     NRF_RADIO->CRCCNF = 0; 
 
     NRF_RADIO->SHORTS = RADIO_SHORTS_READY_START_Msk | RADIO_SHORTS_END_DISABLE_Msk;
@@ -75,8 +77,8 @@ int main(void)
 
     printk("\n\n");
     printk("============================================\n");
-    printk(">>> HUNTER v24 (No-CRC Mode)             <<<\n");
-    printk(">>> Trusting Address: D235CF35           <<<\n");
+    printk(">>> HUNTER v26 (Freq Sync)               <<<\n");
+    printk(">>> Target: 2460/64/70/76 MHz            <<<\n");
     printk("============================================\n");
 
     radio_init();
@@ -87,9 +89,9 @@ int main(void)
         int current_freq = target_freqs[freq_idx];
         NRF_RADIO->FREQUENCY = current_freq;
         
-        printk(">>> Scanning %d MHz... (Pipe 4-7 Only)\n", 2400 + current_freq);
+        printk(">>> Scanning %d MHz...\n", 2400 + current_freq);
 
-        int64_t end_time = k_uptime_get() + 500;
+        int64_t end_time = k_uptime_get() + 300; // 掃快一點，跟上跳頻
 
         while (k_uptime_get() < end_time) {
             
@@ -107,21 +109,19 @@ int main(void)
             }
 
             if (received) {
-                // 不檢查 CRCSTATUS，直接收！
+                // 抓到數據！
                 gpio_pin_toggle_dt(&led);
-
-                int pipe = NRF_RADIO->RXMATCH;
                 int8_t rssi = -(int8_t)NRF_RADIO->RSSISAMPLE; 
                 
-                // 只要訊號不太弱，我們就認為是真貨
+                // 只要有訊號就印，因為我們沒開 CRC
                 if (rssi > -90) {
-                    printk("\n!!! [CAPTURE] Pipe %d | Freq %d | RSSI %d !!!\n", pipe, 2400 + current_freq, rssi);
-                    printk("Raw Data: ");
+                    printk("\n!!! [JACKPOT] Freq %d | RSSI %d !!!\n", 2400 + current_freq, rssi);
+                    printk("Data: ");
                     for(int k=0; k<32; k++) printk("%02X ", rx_buffer[k]);
                     printk("\n");
                     
-                    // 抓到了就延長監聽
-                    end_time += 500; 
+                    // 稍微延長停留，看能不能抓連續包
+                    end_time += 200; 
                 }
                 NRF_RADIO->EVENTS_END = 0;
             } else {
