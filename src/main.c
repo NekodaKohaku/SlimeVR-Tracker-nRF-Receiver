@@ -11,7 +11,7 @@
 
 // 1. 鎖定頻率: 2404 MHz 
 // (證據: 暫存器 0x40001508 = 04)
-#define TARGET_FREQ  4 
+#define TARGET_FREQ  78
 
 // 2. 鎖定地址: Pipe 1 的真實組合
 // (證據: BASE1=d235cf35, PREFIX0 Byte1=00)
