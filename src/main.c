@@ -9,7 +9,7 @@
 // 🕵️‍♂️ 智慧型監聽器 (Smart Listener)
 // ============================================================
 
-static const uint8_t SCAN_CHANNELS[] = {4}; // 2404 & 2478 MHz
+static const uint8_t SCAN_CHANNELS[] = {78}; // 2404 & 2478 MHz
 #define SPY_ADDR_BASE   0xd235cf35
 #define SPY_ADDR_PREFIX 0x00
 
