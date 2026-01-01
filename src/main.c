@@ -5,24 +5,24 @@
 #include <zephyr/drivers/gpio.h>
 #include <string.h>
 
-// ================= 狙擊手設定 (根據 PyOCD 證據) =================
+// ================= 最終參數 (來自 Register Dump) =================
 
-// 1. 真實頻率: 2404 MHz (Register 0x40001508 = 04)
+// 1. 頻率: 2404 MHz (Register 1508 = 04)
 #define TARGET_FREQ  4 
 
-// 2. 真實地址: Pipe 1 組合
-// BASE1: D235CF35, PREFIX1: 00
-#define TARGET_ADDR_BASE   0xD235CF35
-#define TARGET_ADDR_PREFIX 0x00
+// 2. 地址: Pipe 1 組合
+// BASE1 = 552c6a1e, PREFIX Byte 1 = cf
+// 組合起來我們要在 Dongle 發送時，把這組變成我們的 "BASE0 + PREFIX0" 來發送
+#define TARGET_ADDR_BASE   0x552c6a1e
+#define TARGET_ADDR_PREFIX 0xcf
 
-// 3. 測試 Payload
-// 因為之前的 Payload 其實是暫存器值，我們現在發送一個標準的
-// "空包彈" (Empty Packet) 或簡單的 Ping，只求觸發 ACK。
+// 3. Payload
+// 既然地址對了，我們隨便發個空封包試試，看能不能觸發 ACK
 static const uint8_t TARGET_PAYLOAD[] = { 
-    0x01, 0x02, 0x03, 0x04 // 隨便發一點數據測試連通性
+    0x01, 0x02, 0x03, 0x04 
 };
 
-// =============================================================
+// ===============================================================
 
 #define LED0_NODE DT_ALIAS(led0)
 static const struct gpio_dt_spec led = GPIO_DT_SPEC_GET(LED0_NODE, gpios);
@@ -42,7 +42,7 @@ void radio_init(void) {
     k_busy_wait(500);
     NRF_RADIO->POWER = 1;
 
-    // 開啟 16-bit CRC (根據 Register 0x40001534 = 2)
+    // 開啟 CRC 16-bit (Register 1534 = 2)
     NRF_RADIO->CRCCNF = (RADIO_CRCCNF_LEN_Two << RADIO_CRCCNF_LEN_Pos);
     NRF_RADIO->CRCPOLY = 0x11021; 
     NRF_RADIO->CRCINIT = 0xFFFF;
@@ -52,23 +52,20 @@ void radio_init(void) {
     // PCNF0: S0=0, S1=0, L=8
     NRF_RADIO->PCNF0 = (8UL << RADIO_PCNF0_LFLEN_Pos);
     
-    // PCNF1: 根據 Register 0x40001548 (你的 Dump 有看到 7f 但我們設標準值)
+    // PCNF1: 4 Byte Base + 1 Byte Prefix
     NRF_RADIO->PCNF1 = (60UL << RADIO_PCNF1_MAXLEN_Pos) | 
-                       (4UL  << RADIO_PCNF1_BALEN_Pos) | // Base Address 4 bytes
-                       (1UL  << RADIO_PCNF1_ENDIAN_Pos); // Big Endian
+                       (4UL  << RADIO_PCNF1_BALEN_Pos) | 
+                       (1UL  << RADIO_PCNF1_ENDIAN_Pos);
 
     NRF_RADIO->FREQUENCY = TARGET_FREQ;
 
     // ★ 設定 Dongle 發射地址 ★
-    // 我們要發給追蹤器的 Pipe 1，所以 Dongle 發射時要用同樣的組合
-    NRF_RADIO->BASE0 = TARGET_ADDR_BASE;
-    NRF_RADIO->PREFIX0 = TARGET_ADDR_PREFIX; // 設定 Prefix Byte 0 為 00
+    // 我們要把 Dongle 的 "Pipe 0" 偽裝成追蹤器的 "Pipe 1"
+    NRF_RADIO->BASE0 = TARGET_ADDR_BASE;   // 552c6a1e
+    NRF_RADIO->PREFIX0 = TARGET_ADDR_PREFIX; // cf
     
-    // Dongle 發射使用 Logical Address 0 (即 BASE0 + PREFIX0 的 Byte 0)
-    NRF_RADIO->TXADDRESS = 0; 
-    
-    // 接收時也要聽這個地址 (為了收 ACK)
-    NRF_RADIO->RXADDRESSES = 1; 
+    NRF_RADIO->TXADDRESS = 0; // 使用 Logical Address 0 發射
+    NRF_RADIO->RXADDRESSES = 1; // 接收 ACK
 }
 
 void attack_sequence(void) {
@@ -98,7 +95,7 @@ void attack_sequence(void) {
 
     while (k_uptime_get() < timeout) {
         if (NRF_RADIO->EVENTS_END) {
-            // 檢查 CRC 是否正確 (CRCSTATUS = 1)
+            // 檢查 CRC
             if (NRF_RADIO->CRCSTATUS == 1) {
                 ack_received = true;
                 break;
@@ -113,8 +110,7 @@ void attack_sequence(void) {
     if (ack_received) {
         int8_t rssi = -(int8_t)NRF_RADIO->RSSISAMPLE;
         
-        // 為了引起你的注意，如果成功收到 ACK，我們會印出非常明顯的訊息
-        printk("\n!!! CONNECTED !!! [Freq: 2404MHz] [Addr: 00%X] RSSI: %d\n", (uint32_t)TARGET_ADDR_BASE, rssi);
+        printk("\n!!! CONNECTED !!! [Addr: CF 55 2C 6A 1E] RSSI: %d\n", rssi);
         
         // 狂閃燈
         for(int i=0;i<20;i++) {
@@ -132,14 +128,13 @@ int main(void) {
         gpio_pin_configure_dt(&led, GPIO_OUTPUT_ACTIVE);
     }
 
-    printk("\n=== SNIPER ATTACKER (Target: 2404MHz) ===\n");
-    printk("Configured based on PyOCD Register Dump\n");
-
+    printk("\n=== FINAL SNIPER (Target: 2404MHz / Pipe 1) ===\n");
+    
     radio_init();
 
     while (1) {
         attack_sequence();
         gpio_pin_toggle_dt(&led);
-        k_sleep(K_MSEC(100)); // 10次/秒
+        k_sleep(K_MSEC(100));
     }
 }
