@@ -5,26 +5,24 @@
 #include <zephyr/drivers/gpio.h>
 #include <string.h>
 
-// ================= USER SETTINGS (改這裡!) =================
+// ================= 狙擊手設定 (根據 PyOCD 證據) =================
 
-// 1. 設定頻率 (例如 78 = 2478 MHz)
-#define TARGET_FREQ  78 
+// 1. 真實頻率: 2404 MHz (Register 0x40001508 = 04)
+#define TARGET_FREQ  4 
 
-// 2. 設定地址 (PyOCD 抓到的 Sync Word)
-// 格式: 0xD235CF35
-#define TARGET_ADDR  0xD235CF35
+// 2. 真實地址: Pipe 1 組合
+// BASE1: D235CF35, PREFIX1: 00
+#define TARGET_ADDR_BASE   0xD235CF35
+#define TARGET_ADDR_PREFIX 0x00
 
-// 3. 設定喚醒指令 (Payload)
-// 這是你抓到的: 23 C3 00 C0 13 E3 63 A3 00 00 00 01
-static const uint8_t TARGET_PAYLOAD[] = {
-    0x23, 0xC3, 0x00, 0xC0, 0x13, 0xE3, 0x63, 0xA3, 
-    0x00, 0x00, 0x00, 0x01
+// 3. 測試 Payload
+// 因為之前的 Payload 其實是暫存器值，我們現在發送一個標準的
+// "空包彈" (Empty Packet) 或簡單的 Ping，只求觸發 ACK。
+static const uint8_t TARGET_PAYLOAD[] = { 
+    0x01, 0x02, 0x03, 0x04 // 隨便發一點數據測試連通性
 };
 
-// 4. 發送間隔 (毫秒)
-#define TX_INTERVAL_MS  500
-
-// ==========================================================
+// =============================================================
 
 #define LED0_NODE DT_ALIAS(led0)
 static const struct gpio_dt_spec led = GPIO_DT_SPEC_GET(LED0_NODE, gpios);
@@ -44,42 +42,49 @@ void radio_init(void) {
     k_busy_wait(500);
     NRF_RADIO->POWER = 1;
 
-    // 設定為 BLE 2M (如果失敗，下次改這裡換成 NRF_RADIO_MODE_NRF_1MBIT 試試)
-    NRF_RADIO->MODE = NRF_RADIO_MODE_BLE_2MBIT; 
+    // 開啟 16-bit CRC (根據 Register 0x40001534 = 2)
+    NRF_RADIO->CRCCNF = (RADIO_CRCCNF_LEN_Two << RADIO_CRCCNF_LEN_Pos);
+    NRF_RADIO->CRCPOLY = 0x11021; 
+    NRF_RADIO->CRCINIT = 0xFFFF;
 
-    // 封包格式 (Raw Payload)
+    NRF_RADIO->MODE = NRF_RADIO_MODE_BLE_2MBIT; 
+    
+    // PCNF0: S0=0, S1=0, L=8
     NRF_RADIO->PCNF0 = (8UL << RADIO_PCNF0_LFLEN_Pos);
+    
+    // PCNF1: 根據 Register 0x40001548 (你的 Dump 有看到 7f 但我們設標準值)
     NRF_RADIO->PCNF1 = (60UL << RADIO_PCNF1_MAXLEN_Pos) | 
-                       (4UL  << RADIO_PCNF1_BALEN_Pos) | 
-                       (1UL  << RADIO_PCNF1_ENDIAN_Pos);
+                       (4UL  << RADIO_PCNF1_BALEN_Pos) | // Base Address 4 bytes
+                       (1UL  << RADIO_PCNF1_ENDIAN_Pos); // Big Endian
 
     NRF_RADIO->FREQUENCY = TARGET_FREQ;
-    NRF_RADIO->CRCCNF = 0; // 預設關閉 CRC，想開改這裡
 
-    // 設定地址
-    NRF_RADIO->BASE0 = TARGET_ADDR;
-    NRF_RADIO->PREFIX0 = 0x00;
+    // ★ 設定 Dongle 發射地址 ★
+    // 我們要發給追蹤器的 Pipe 1，所以 Dongle 發射時要用同樣的組合
+    NRF_RADIO->BASE0 = TARGET_ADDR_BASE;
+    NRF_RADIO->PREFIX0 = TARGET_ADDR_PREFIX; // 設定 Prefix Byte 0 為 00
+    
+    // Dongle 發射使用 Logical Address 0 (即 BASE0 + PREFIX0 的 Byte 0)
+    NRF_RADIO->TXADDRESS = 0; 
+    
+    // 接收時也要聽這個地址 (為了收 ACK)
     NRF_RADIO->RXADDRESSES = 1; 
 }
 
-void send_and_listen(void) {
-    // 1. 準備 Payload
+void attack_sequence(void) {
     memcpy(packet_buffer, TARGET_PAYLOAD, sizeof(TARGET_PAYLOAD));
     
     radio_disable();
 
-    // 2. 設定 TX
+    // 1. 發射 (TX)
     NRF_RADIO->PACKETPTR = (uint32_t)packet_buffer;
     NRF_RADIO->SHORTS = RADIO_SHORTS_READY_START_Msk; 
     NRF_RADIO->EVENTS_END = 0;
-
-    // 3. 發射
-    // printk("TX...\n"); // 註解掉以減少延遲
     NRF_RADIO->TASKS_TXEN = 1;
     while (NRF_RADIO->EVENTS_END == 0); 
     NRF_RADIO->EVENTS_END = 0;
     
-    // 4. ★ 極速切換到 RX (監聽 ACK) ★
+    // 2. 切換監聽 (RX) 等待 ACK
     NRF_RADIO->TASKS_DISABLE = 1;
     while (NRF_RADIO->EVENTS_DISABLED == 0);
     NRF_RADIO->EVENTS_DISABLED = 0;
@@ -87,56 +92,54 @@ void send_and_listen(void) {
     NRF_RADIO->PACKETPTR = (uint32_t)rx_buffer;
     NRF_RADIO->TASKS_RXEN = 1; 
 
-    // 5. 等待回應 (視窗 20ms)
+    // 3. 視窗 20ms
     int64_t timeout = k_uptime_get() + 20; 
     bool ack_received = false;
 
     while (k_uptime_get() < timeout) {
         if (NRF_RADIO->EVENTS_END) {
-            ack_received = true;
-            break;
+            // 檢查 CRC 是否正確 (CRCSTATUS = 1)
+            if (NRF_RADIO->CRCSTATUS == 1) {
+                ack_received = true;
+                break;
+            } else {
+                 NRF_RADIO->EVENTS_END = 0;
+                 NRF_RADIO->TASKS_START = 1; 
+            }
         }
         k_busy_wait(10); 
     }
 
-    // 6. 輸出結果
     if (ack_received) {
         int8_t rssi = -(int8_t)NRF_RADIO->RSSISAMPLE;
-        NRF_RADIO->TASKS_DISABLE = 1; 
         
-        printk(">>> [ACK RECEIVED!] RSSI: %d\n", rssi);
-        printk("    Data: ");
-        for(int i=0; i<10; i++) printk("%02X ", rx_buffer[i]);
-        printk("\n");
+        // 為了引起你的注意，如果成功收到 ACK，我們會印出非常明顯的訊息
+        printk("\n!!! CONNECTED !!! [Freq: 2404MHz] [Addr: 00%X] RSSI: %d\n", (uint32_t)TARGET_ADDR_BASE, rssi);
         
-        // 抓到 ACK 就狂閃燈
-        for(int i=0;i<5;i++) {
+        // 狂閃燈
+        for(int i=0;i<20;i++) {
             gpio_pin_toggle_dt(&led);
-            k_busy_wait(50000);
+            k_busy_wait(20000);
         }
     } else {
         radio_disable();
-        // printk("."); // 沒收到就印個點，證明還活著
     }
 }
 
 int main(void) {
     usb_enable(NULL);
-    
     if (device_is_ready(led.port)) {
         gpio_pin_configure_dt(&led, GPIO_OUTPUT_ACTIVE);
     }
 
-    printk("\n=== RF ATTACKER STARTED ===\n");
-    printk("Freq: %d MHz\n", 2400 + TARGET_FREQ);
-    printk("Addr: %08X\n", TARGET_ADDR);
+    printk("\n=== SNIPER ATTACKER (Target: 2404MHz) ===\n");
+    printk("Configured based on PyOCD Register Dump\n");
 
     radio_init();
 
     while (1) {
-        send_and_listen();
-        
-        gpio_pin_toggle_dt(&led); // 慢閃代表運作中
-        k_sleep(K_MSEC(TX_INTERVAL_MS));
+        attack_sequence();
+        gpio_pin_toggle_dt(&led);
+        k_sleep(K_MSEC(100)); // 10次/秒
     }
 }
