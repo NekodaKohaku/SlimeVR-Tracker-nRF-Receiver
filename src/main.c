@@ -9,7 +9,7 @@
 #include <stdlib.h> // 需要用到 abs() 取絕對值
 
 // ================= 參數設定 =================
-static const uint8_t TARGET_FREQS[] = {4};
+static const uint8_t TARGET_FREQS[] = {78};
 #define TARGET_ADDR_BASE   0xd235cf35
 #define TARGET_ADDR_PREFIX 0x00
 
