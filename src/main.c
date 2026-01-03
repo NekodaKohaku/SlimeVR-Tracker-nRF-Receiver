@@ -15,8 +15,9 @@
 #define FILTER_IMU_ONLY      0
 
 static const uint8_t target_freqs[] = {
-    4,
-    78,
+    2,  8,
+    34, 36, 40, 42, 44, 46, 48, 50, 52, 54, 56, 58,
+    60, 62, 64, 66, 68, 70, 72, 74, 76, 80,
 };
 
 #define ADDR_BASE_1       0xD235CF35UL
