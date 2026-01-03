@@ -12,12 +12,14 @@
 #define RX_WAIT_US         5000
 #define PRINT_BYTES          64
 
+/* 0 = 完全不印重複包；>0 = 同一包連續收到時，每隔 N ms 印一次“累積次數摘要” */
+#define FLUSH_SAME_AFTER_MS  500
+
 #define FILTER_IMU_ONLY      0
 
 static const uint8_t target_freqs[] = {
-    2, 4, 8,
-    34, 36, 40, 42, 44, 46, 48, 50, 52, 54, 56, 58,
-    60, 62, 64, 66, 68, 70, 72, 74, 76, 78, 80,
+    4,
+    78,
 };
 
 #define ADDR_BASE_1       0xD235CF35UL
@@ -32,17 +34,19 @@ static int lock_freq = -1;
 static int64_t lock_until_ms = 0;
 
 /* ---- Dedup state ---- */
-static uint8_t last_buf[PRINT_BYTES];
-static uint8_t last_len = 0;
+static uint8_t  last_buf[PRINT_BYTES];
+static uint8_t  last_len = 0;
 static uint32_t last_rep = 0;
-static bool have_last = false;
+static bool     have_last = false;
 
-/* store metadata for the run */
+/* metadata for the run */
 static int64_t  last_ts_ms = 0;
 static uint8_t  last_freq_off = 0;
 static int8_t   last_rssi_dbm = -127;
 static uint8_t  last_rxmatch = 0xFF;
 static uint8_t  last_crcok = 0xFF;
+
+static int64_t  last_flush_ms = 0;
 
 static inline void radio_disable_clean(void)
 {
@@ -52,18 +56,24 @@ static inline void radio_disable_clean(void)
     NRF_RADIO->EVENTS_DISABLED = 0;
 }
 
-static inline int8_t radio_sample_rssi_dbm(void)
+/* 回傳：true 表示 RSSIEND 有成功，rssi_dbm 有效；false 表示無效 */
+static inline bool radio_sample_rssi_dbm(int8_t *out_rssi_dbm)
 {
     NRF_RADIO->EVENTS_RSSIEND = 0;
     NRF_RADIO->TASKS_RSSISTART = 1;
 
-    for (int i = 0; i < 200; i++) {
-        if (NRF_RADIO->EVENTS_RSSIEND) break;
+    for (int i = 0; i < 300; i++) {
+        if (NRF_RADIO->EVENTS_RSSIEND) {
+            NRF_RADIO->EVENTS_RSSIEND = 0;
+            if (out_rssi_dbm) *out_rssi_dbm = (int8_t)NRF_RADIO->RSSISAMPLE; /* 通常會是負值 dBm */
+            return true;
+        }
         k_busy_wait(1);
     }
-    NRF_RADIO->EVENTS_RSSIEND = 0;
 
-    return (int8_t)NRF_RADIO->RSSISAMPLE;
+    /* timeout: RSSI 無效 */
+    if (out_rssi_dbm) *out_rssi_dbm = -127;
+    return false;
 }
 
 static inline bool frame_is_imu28(const uint8_t *b)
@@ -73,16 +83,15 @@ static inline bool frame_is_imu28(const uint8_t *b)
 
 static inline uint8_t frame_valid_len(const uint8_t *b)
 {
-    /* 依你觀察：總長度 = LEN + 2 */
+    /* 你目前假設：總長度 = LEN + 2 */
     uint32_t v = (uint32_t)b[0] + 2U;
-
     if (v < 2U) v = 2U;
     if (v > PRINT_BYTES) v = PRINT_BYTES;
     return (uint8_t)v;
 }
 
 /* 一次組好整行，避免 per-byte printk */
-#define LINE_BUF_SZ (96 + (PRINT_BYTES * 3))
+#define LINE_BUF_SZ (110 + (PRINT_BYTES * 3))
 
 static void print_packet_csv_rep(int64_t ts_ms, uint8_t freq_off, int8_t rssi_dbm,
                                  uint8_t rxmatch, uint8_t crcok, uint32_t rep,
@@ -152,28 +161,32 @@ static void radio_init(void)
 }
 
 static bool radio_rx_once(uint8_t freq, uint32_t timeout_us,
-                          int8_t *out_rssi_dbm, uint8_t *out_rxmatch, uint8_t *out_crcok)
+                          int8_t *out_rssi_dbm, bool *out_rssi_valid,
+                          uint8_t *out_rxmatch, uint8_t *out_crcok)
 {
     NRF_RADIO->FREQUENCY = freq;
     NRF_RADIO->PACKETPTR = (uint32_t)rx_buffer;
 
-    /* 清掉 buffer，避免你固定印時看到殘影；同時也讓 debug 更乾淨 */
-    memset(rx_buffer, 0, PRINT_BYTES);
-
     NRF_RADIO->EVENTS_END = 0;
     NRF_RADIO->EVENTS_DISABLED = 0;
+    NRF_RADIO->EVENTS_READY = 0;
     NRF_RADIO->EVENTS_RSSIEND = 0;
 
     radio_disable_clean();
     NRF_RADIO->TASKS_RXEN = 1;
 
-    int8_t rssi_dbm = radio_sample_rssi_dbm();
+    /* 等 READY，避免 RSSI/收包狀態沒起來 */
+    for (uint32_t i = 0; i < 300; i++) {
+        if (NRF_RADIO->EVENTS_READY) break;
+        k_busy_wait(1);
+    }
+    NRF_RADIO->EVENTS_READY = 0;
+
+    int8_t rssi_dbm = -127;
+    bool rssi_valid = radio_sample_rssi_dbm(&rssi_dbm);
 
     for (uint32_t i = 0; i < timeout_us; i++) {
         if (NRF_RADIO->EVENTS_END) {
-            if (rssi_dbm == -127) {
-                rssi_dbm = radio_sample_rssi_dbm();
-            }
 
             uint8_t rxmatch = (uint8_t)(NRF_RADIO->RXMATCH & 0xFF);
 
@@ -182,10 +195,10 @@ static bool radio_rx_once(uint8_t freq, uint32_t timeout_us,
 #else
             uint8_t crcok = 255;
 #endif
-
-            if (out_rssi_dbm) *out_rssi_dbm = rssi_dbm;
-            if (out_rxmatch)  *out_rxmatch  = rxmatch;
-            if (out_crcok)    *out_crcok    = crcok;
+            if (out_rssi_dbm)   *out_rssi_dbm = rssi_dbm;
+            if (out_rssi_valid) *out_rssi_valid = rssi_valid;
+            if (out_rxmatch)    *out_rxmatch  = rxmatch;
+            if (out_crcok)      *out_crcok    = crcok;
 
 #if ENABLE_HW_CRC
             if (!NRF_RADIO->CRCSTATUS) {
@@ -224,13 +237,13 @@ int main(void)
 #else
     printk("CRC16: OFF\n");
 #endif
-#if FILTER_IMU_ONLY
-    printk("Filter: IMU only (0x1C 0x03 0x00)\n");
+    printk("Filter: CRCOK frames; RSSI>%d dBm only when RSSI is valid\n", RSSI_THRESHOLD_DBM);
+    printk("Output: PKT,ts_ms,freq_mhz,off,pipe,rssi_dbm,crcok,rep,hex...\n");
+#if FLUSH_SAME_AFTER_MS
+    printk("Dedup: print on change; also flush same packet every %d ms with growing rep\n", FLUSH_SAME_AFTER_MS);
 #else
-    printk("Filter: ALL CRCOK frames (RSSI>%d dBm)\n", RSSI_THRESHOLD_DBM);
+    printk("Dedup: print first packet; then only print when content changes\n");
 #endif
-    printk("Output: CSV  PKT,ts_ms,freq_mhz,off,pipe,rssi_dbm,crcok,rep,hex...\n");
-    printk("Note: Only prints when packet content changes; rep is the run length.\n");
     printk("============================================\n");
 
     radio_init();
@@ -254,22 +267,21 @@ int main(void)
         int64_t dwell_end = k_uptime_get() + DWELL_MS;
 
         while (k_uptime_get() < dwell_end) {
-            int8_t rssi_dbm = -127;
+            int8_t  rssi_dbm = -127;
+            bool    rssi_valid = false;
             uint8_t rxmatch = 0xFF;
             uint8_t crcok   = 0xFF;
 
-            bool ok = radio_rx_once(current_freq, RX_WAIT_US, &rssi_dbm, &rxmatch, &crcok);
+            bool ok = radio_rx_once(current_freq, RX_WAIT_US, &rssi_dbm, &rssi_valid, &rxmatch, &crcok);
             if (!ok) {
                 continue;
             }
 
-            /* RSSI=127 常見是無效/沒取到，避免它誤過濾 */
-            if (rssi_dbm > 0) {
-                rssi_dbm = -127;
-            }
-
-            if (rssi_dbm <= RSSI_THRESHOLD_DBM) {
-                continue;
+            /* 只有在 RSSI 有效時才做門檻過濾，避免 RSSI 失效造成全滅 */
+            if (rssi_valid) {
+                if (rssi_dbm <= RSSI_THRESHOLD_DBM) {
+                    continue;
+                }
             }
 
 #if FILTER_IMU_ONLY
@@ -288,35 +300,64 @@ int main(void)
                 same = true;
             }
 
-            if (same) {
-                last_rep++;
-                /* 想用「最後一次」的 meta 也可以更新 */
+            if (!have_last) {
+                /* 第一包直接印，保證你看到東西 */
+                memcpy(last_buf, rx_buffer, cur_len);
+                last_len = cur_len;
+                last_rep = 1;
+                have_last = true;
+
                 last_ts_ms = ts;
                 last_freq_off = current_freq;
                 last_rssi_dbm = rssi_dbm;
                 last_rxmatch  = rxmatch;
                 last_crcok    = crcok;
-                continue;
-            }
+                last_flush_ms = ts;
 
-            /* packet changed: flush previous run once */
-            if (have_last) {
+                print_packet_csv_rep(last_ts_ms, last_freq_off, last_rssi_dbm,
+                                     last_rxmatch, last_crcok, last_rep,
+                                     last_buf, last_len);
+            } else if (same) {
+                last_rep++;
+
+                /* 更新 meta，讓你看到「最新一次」的時間/頻點/RSSI */
+                last_ts_ms = ts;
+                last_freq_off = current_freq;
+                last_rssi_dbm = rssi_dbm;
+                last_rxmatch  = rxmatch;
+                last_crcok    = crcok;
+
+#if FLUSH_SAME_AFTER_MS
+                if ((ts - last_flush_ms) >= FLUSH_SAME_AFTER_MS) {
+                    last_flush_ms = ts;
+                    print_packet_csv_rep(last_ts_ms, last_freq_off, last_rssi_dbm,
+                                         last_rxmatch, last_crcok, last_rep,
+                                         last_buf, last_len);
+                }
+#endif
+                continue;
+            } else {
+                /* content changed: 印一次上一段 run 的最終狀態 */
+                print_packet_csv_rep(last_ts_ms, last_freq_off, last_rssi_dbm,
+                                     last_rxmatch, last_crcok, last_rep,
+                                     last_buf, last_len);
+
+                /* 開新 run，並立即印出新封包（不然你又會覺得沒輸出） */
+                memcpy(last_buf, rx_buffer, cur_len);
+                last_len = cur_len;
+                last_rep = 1;
+
+                last_ts_ms = ts;
+                last_freq_off = current_freq;
+                last_rssi_dbm = rssi_dbm;
+                last_rxmatch  = rxmatch;
+                last_crcok    = crcok;
+                last_flush_ms = ts;
+
                 print_packet_csv_rep(last_ts_ms, last_freq_off, last_rssi_dbm,
                                      last_rxmatch, last_crcok, last_rep,
                                      last_buf, last_len);
             }
-
-            /* start new run (do NOT print immediately; wait until it changes) */
-            memcpy(last_buf, rx_buffer, cur_len);
-            last_len = cur_len;
-            last_rep = 1;
-            have_last = true;
-
-            last_ts_ms = ts;
-            last_freq_off = current_freq;
-            last_rssi_dbm = rssi_dbm;
-            last_rxmatch  = rxmatch;
-            last_crcok    = crcok;
 
             lock_freq = current_freq;
             lock_until_ms = k_uptime_get() + LOCK_ON_MS;
