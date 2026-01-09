@@ -5,330 +5,243 @@
 #include <hal/nrf_radio.h>
 #include <string.h>
 
-#define ENABLE_HW_CRC        1   // 1=用硬體 CRC16 過濾並回報 CRCOK；0=不做 CRC（較不會漏，但噪聲多）
-#define RSSI_THRESHOLD_DBM  -95  // 只記錄 RSSI 大於此值（例如 -80 > -95）
-#define LOCK_ON_MS         1500  // 命中後鎖住該頻點多久
-#define DWELL_MS            200  // 每個頻點掃描停留時間
-#define RX_WAIT_US         5000  // 每次 RX window 等待 END 的時間
-#define PRINT_BYTES          64  // 固定印 64 bytes（足夠容納 MAXLEN=55 的封包）
+// ---------------------------------------------------------
+// 參數定義 (來自逆向工程)
+// ---------------------------------------------------------
+#define PUBLIC_ADDR      0x552C6A1E
+#define PAYLOAD_ID_SALT  0xB9522E32  // 你的 Payload ID (Little Endian in math)
 
-// 若你只想記錄 IMU(0x1C 0x03 0x00) 封包，把這個改成 1
-#define FILTER_IMU_ONLY      0
-
-// 你實測出現的低頻點 + 高頻 hopping 集合（依你貼的頻點補齊）
-static const uint8_t target_freqs[] = {
-    // 低頻/同步候選（你量到 2402/2404/2408）
-    2, 4, 8,
-
-    // 高頻集合（你量到 2434~2480，偏偶數）
-    34, 36, 40, 42, 44, 46, 48, 50, 52, 54, 56, 58,
-    60, 62, 64, 66, 68, 70, 72, 74, 76, 78, 80,
+// Dongle 發送的挑戰包 (模擬 V80)
+// 格式: Header(4) + Payload(Variable) + Salt(4)
+static uint8_t tx_packet[] = {
+    // Header (11 02 04 00)
+    0x11, 0x02, 0x04, 0x00, 
+    // Payload (任意填充，只要結尾是 Salt)
+    0x7C, 0x00, 0x00, 0x00, 0x55, 0x00, 0x00, 0x08, 0x80, 0xA4,
+    // Salt (B9 52 2E 32 -> Little Endian stored as 32 2E 52 B9)
+    0x32, 0x2E, 0x52, 0xB9, 
+    0x01 // PID / Seq
 };
 
-// 依你 SWD dump：pipe1 使用 BASE1 + PREFIX0.AP1(=0x00)
-#define ADDR_BASE_1       0xD235CF35UL
-#define ADDR_PREFIX0      0x23C300C0UL   // pipe0=C0, pipe1=00, pipe2=C3, pipe3=23
+// 接收緩衝區
+static uint8_t rx_buffer[32];
 
-// LED
-#define LED0_NODE DT_ALIAS(led0)
-static const struct gpio_dt_spec led = GPIO_DT_SPEC_GET(LED0_NODE, gpios);
+// ---------------------------------------------------------
+// 輔助函數
+// ---------------------------------------------------------
 
-// RX buffer（DMA 要求 4-byte aligned）
-static uint8_t rx_buffer[PRINT_BYTES] __aligned(4);
+// ARM RBIT 指令 (反轉位元)
+static uint32_t rbit(uint32_t value) {
+    uint32_t result;
+    // 使用 ARM 內建指令加速
+    __asm volatile ("rbit %0, %1" : "=r" (result) : "r" (value));
+    return result;
+}
 
-static int lock_freq = -1;
-static int64_t lock_until_ms = 0;
-
-/* ---------------- Dedup + run-length count ---------------- */
-static bool have_last = false;
-static uint8_t last_buf[PRINT_BYTES];
-static uint32_t last_rep = 0;
-
-/* 用「最後一次看到這包」的 meta 來印（比較貼近你 log 的 timestamp/freq） */
-static int64_t last_ts_ms = 0;
-static uint8_t last_freq_off = 0;
-static int8_t last_rssi_dbm = -127;
-static uint8_t last_rxmatch = 0xFF;
-static uint8_t last_crcok = 0xFF;
-/* ---------------------------------------------------------- */
-
-static inline void radio_disable_clean(void)
-{
-    NRF_RADIO->EVENTS_DISABLED = 0;
+// 初始化無線電 (模擬 Python V80 的設定)
+void radio_init(uint32_t frequency) {
+    // 1. 關閉無線電
     NRF_RADIO->TASKS_DISABLE = 1;
-    while (NRF_RADIO->EVENTS_DISABLED == 0) { /* wait */ }
+    while (NRF_RADIO->EVENTS_DISABLED == 0);
     NRF_RADIO->EVENTS_DISABLED = 0;
+
+    // 2. 設定物理層
+    NRF_RADIO->TXPOWER   = (RADIO_TXPOWER_TXPOWER_0dBm << RADIO_TXPOWER_TXPOWER_Pos);
+    NRF_RADIO->FREQUENCY = frequency; 
+    NRF_RADIO->MODE      = (RADIO_MODE_MODE_Nrf_2Mbit << RADIO_MODE_MODE_Pos);
+
+    // 3. 設定地址 (Base0 = Public)
+    NRF_RADIO->PREFIX0 = 0;
+    NRF_RADIO->BASE0   = PUBLIC_ADDR;
+    NRF_RADIO->TXADDRESS   = 0; // 使用 Base0 發送
+    NRF_RADIO->RXADDRESSES = 1; // 使用 Base0 接收
+
+    // 4. 設定封包結構 (PCNF0/1) - 必須與 PICO 嚴格匹配
+    // LFLEN=8bit, S0LEN=1bit, S1LEN=0
+    NRF_RADIO->PCNF0 = (8 << RADIO_PCNF0_LFLEN_Pos) |
+                       (1 << RADIO_PCNF0_S0LEN_Pos) |
+                       (0 << RADIO_PCNF0_S1LEN_Pos);
+
+    // MaxLen=255, Balen=3 (Base address length 4 bytes total), Endian=Little
+    NRF_RADIO->PCNF1 = (255 << RADIO_PCNF1_MAXLEN_Pos) |
+                       (3   << RADIO_PCNF1_BALEN_Pos) |
+                       (RADIO_PCNF1_ENDIAN_Little << RADIO_PCNF1_ENDIAN_Pos) |
+                       (1   << RADIO_PCNF1_WHITEEN_Pos); // 如果有開 Whitening 就要加，通常 PICO 有開
+
+    // 5. CRC 設定 (3 bytes)
+    NRF_RADIO->CRCCNF = (RADIO_CRCCNF_LEN_Three << RADIO_CRCCNF_LEN_Pos) |
+                        (RADIO_CRCCNF_SKIPADDR_Skip << RADIO_CRCCNF_SKIPADDR_Pos);
+    NRF_RADIO->CRCINIT = 0xFFFF; // 通常初始值
+    NRF_RADIO->CRCPOLY = 0x11021; // CRC-CCITT (需要確認，通常 nRF 預設)
 }
 
-static inline int8_t radio_sample_rssi_dbm(void)
-{
-    // 要求：RADIO 在 RX 狀態（TASKS_RXEN 已下）
-    NRF_RADIO->EVENTS_RSSIEND = 0;
-    NRF_RADIO->TASKS_RSSISTART = 1;
+// 計算私有地址算法
+uint32_t calculate_pico_address(uint32_t ficr) {
+    // 1. FICR + Salt (Byte-wise addition)
+    // 為了方便，我們把它當作 byte array 處理
+    uint8_t *f = (uint8_t*)&ficr;
+    uint8_t *s = (uint8_t*)&(uint32_t){PAYLOAD_ID_SALT}; // 0xB9522E32
+    uint8_t res[4];
 
-    // RSSI 取樣通常很快（幾十 us），但我們加個小 timeout 保險
-    for (int i = 0; i < 200; i++) {
-        if (NRF_RADIO->EVENTS_RSSIEND) break;
-        k_busy_wait(1);
+    // 注意：這裡是 Little Endian 記憶體佈局
+    // FICR: 19 7E A1 F3 (0xF3A17E19)
+    // Salt: 32 2E 52 B9 (0xB9522E32)
+    
+    for(int i=0; i<4; i++) {
+        res[i] = (f[i] + s[i]) & 0xFF;
     }
-    NRF_RADIO->EVENTS_RSSIEND = 0;
 
-    // 直接讀負值 dBm（不要取負號）
-    return (int8_t)NRF_RADIO->RSSISAMPLE;
+    // 組合回 32-bit (因為我們要 RBIT，這裡要小心 Endian)
+    // 根據 Python 邏輯：AC F3 AC 4B -> RBIT -> D2 35 CF 35
+    // 我們需要構建 0x4BACF3AC 讓 RBIT 翻轉成 0xD235CF35 ?
+    // 不，RBIT 是 bit 級別反轉。
+    
+    // 讓我們直接用整數加法模擬 Python 的 byte-wise 行為
+    // Python: AC F3 AC 4B (Big Endian representation of calculation result)
+    // 我們要構造這個整數
+    uint32_t combined = (res[3] << 24) | (res[2] << 16) | (res[1] << 8) | res[0];
+    
+    // 執行 RBIT
+    return rbit(combined);
 }
 
-static inline bool frame_is_imu28(const uint8_t *b)
+// ---------------------------------------------------------
+// 主邏輯
+// ---------------------------------------------------------
+void main(void)
 {
-    // 你的 v2.0：len=0x1C, header=0x03 0x00
-    return (b[0] == 0x1C && b[1] == 0x03 && b[2] == 0x00);
-}
+    // 初始化 USB (看 Log 用)
+    if (usb_enable(NULL)) {
+        return;
+    }
+    k_sleep(K_SECONDS(1)); // 等 USB 連上
+    printk("=== PICO Dongle Clone Starting ===\n");
 
-static void radio_init(void)
-{
-    NRF_RADIO->POWER = 0;
-    k_busy_wait(500);
-    NRF_RADIO->POWER = 1;
+    // 配對用的頻率列表 (掃描這三個)
+    uint8_t channels[] = {1, 26, 80}; // 2401, 2426, 2480 MHz
+    int ch_idx = 0;
 
-    // PHY: BLE 2Mbit (MODE=4)
-    NRF_RADIO->MODE = NRF_RADIO_MODE_BLE_2MBIT;
+    bool paired = false;
+    uint32_t private_id = 0;
 
-    // PCNF0: 0x00040008 => LFLEN=8, S0LEN=0, S1LEN=4
-    NRF_RADIO->PCNF0 =
-        (8UL << RADIO_PCNF0_LFLEN_Pos) |
-        (0UL << RADIO_PCNF0_S0LEN_Pos) |
-        (4UL << RADIO_PCNF0_S1LEN_Pos);
+    // --- 階段一：配對 (Ping-Pong Loop) ---
+    while (!paired) {
+        // 設定頻率
+        radio_init(channels[ch_idx]);
+        printk("Scanning on Channel %d...\n", channels[ch_idx]);
 
-    // PCNF1: 固定 MAXLEN=64（可涵蓋對方偶爾用 0x23 / 0x37）
-    // STATLEN=0, BALEN=4 (=> address length 5 bytes), ENDIAN=1, WHITEEN=0
-    NRF_RADIO->PCNF1 =
-        (PRINT_BYTES << RADIO_PCNF1_MAXLEN_Pos) |
-        (0UL        << RADIO_PCNF1_STATLEN_Pos) |
-        (4UL        << RADIO_PCNF1_BALEN_Pos)   |
-        (1UL        << RADIO_PCNF1_ENDIAN_Pos)  |
-        (0UL        << RADIO_PCNF1_WHITEEN_Pos);
+        // 嘗試發送 10 次請求
+        for(int i=0; i<10; i++) {
+            // 1. 設定 TX Buffer
+            NRF_RADIO->PACKETPTR = (uint32_t)tx_packet;
+            
+            // 2. 設定 SHORTS (TX -> RX 自動切換)
+            // READY->START (自動發)
+            // END->DISABLE (發完關)
+            // DISABLED->RXEN (關完開收 - 抓 ACK)
+            NRF_RADIO->SHORTS = RADIO_SHORTS_READY_START_Msk | 
+                                RADIO_SHORTS_END_DISABLE_Msk | 
+                                RADIO_SHORTS_DISABLED_RXEN_Msk;
 
-    // Address: pipe1 only
-    NRF_RADIO->BASE1   = ADDR_BASE_1;
-    NRF_RADIO->PREFIX0 = ADDR_PREFIX0;
-    NRF_RADIO->TXADDRESS   = 1;          // 不是 sniff 必需，但照你 dump 設定
-    NRF_RADIO->RXADDRESSES = (1UL << 1); // 只開 pipe1
+            // 清除事件
+            NRF_RADIO->EVENTS_END = 0;
+            NRF_RADIO->EVENTS_DISABLED = 0;
 
-#if ENABLE_HW_CRC
-    // CRC16: CRCCNF=2, POLY=0x11021, INIT=0xFFFF
-    NRF_RADIO->CRCCNF  = 2;
-    NRF_RADIO->CRCPOLY = 0x00011021;
-    NRF_RADIO->CRCINIT = 0x0000FFFF;
-#else
-    NRF_RADIO->CRCCNF = 0;
-#endif
+            // 3. 啟動發送 (觸發整個 SHORTS 鏈)
+            NRF_RADIO->TASKS_TXEN = 1;
 
-    // SHORTS: READY->START, END->DISABLE
-    NRF_RADIO->SHORTS =
-        RADIO_SHORTS_READY_START_Msk |
-        RADIO_SHORTS_END_DISABLE_Msk;
+            // 4. 等待發送完成，並進入 RX 狀態
+            // 我們這裡給它一點時間自動切換
+            while(NRF_RADIO->EVENTS_DISABLED == 0); // TX 完成
+            NRF_RADIO->EVENTS_DISABLED = 0;
+            
+            // 此時硬體應該已經自動跳到 RXEN -> READY -> START (因為 SHORTS 沒設 RX 的停止)
+            // 我們手動設定 RX 的接收 Buffer (最好在 TX 前設好，但這裡為了簡單)
+            NRF_RADIO->PACKETPTR = (uint32_t)rx_buffer;
+            
+            // 啟動 RX (如果 SHORTS 沒自動幫我們 Start，手動補一腳)
+            if (NRF_RADIO->STATE != RADIO_STATE_STATE_Rx) {
+                NRF_RADIO->TASKS_START = 1; 
+            }
 
-    // 保持乾淨狀態
-    radio_disable_clean();
-}
+            // 5. 聽 10ms 等 ACK
+            k_busy_wait(10000); 
 
-static bool radio_rx_once(uint8_t freq, uint32_t timeout_us,
-                          int8_t *out_rssi_dbm, uint8_t *out_rxmatch, uint8_t *out_crcok)
-{
-    NRF_RADIO->FREQUENCY = freq;
+            if (NRF_RADIO->EVENTS_END) {
+                // 收到東西了！
+                if (NRF_RADIO->CRCSTATUS == 1) { // CRC 正確
+                    // 檢查封包特徵 (Header 0D 02 02 00)
+                    // rx_buffer[0] 是長度
+                    if (rx_buffer[0] == 0x0D) {
+                        printk("Captured Packet! Length: 13\n");
+                        
+                        // 提取 FICR (Offset 4, 5, 6, 7)
+                        // rx_buffer: [Len] [S0] [S1] [F0] [F1] [F2] [F3] ...
+                        //             0    1    2    3    4    5    6    
+                        // 注意 S0, S1 位元偏移，通常 RAM 裡 Byte 3 開始是 Payload
+                        // 假設: Len(0), S0(1), S1(2), Payload[0]...
+                        // 根據你的 Dump: 0D 02 02 00 19 ...
+                        // Len=0D, S0=02, S1=00(padded?)
+                        // 實際上 nRF EasyDMA 會把 Header 分開還是合再一起取決於設定
+                        // 簡單起見，我們掃描 buffer 找 FICR 特徵
+                        
+                        // 假設 FICR 在 buffer[4] ~ buffer[7]
+                        uint32_t ficr = 0;
+                        memcpy(&ficr, &rx_buffer[4], 4); // 19 7E A1 F3 -> 0xF3A17E19
+                        
+                        printk("Found FICR: %08X\n", ficr);
+                        
+                        // 計算地址
+                        private_id = calculate_pico_address(ficr);
+                        printk("Calculated Private ID: %08X\n", private_id);
+                        
+                        paired = true;
+                        break;
+                    }
+                }
+                // 停止接收，準備下一次 Ping
+                NRF_RADIO->TASKS_DISABLE = 1;
+                while(NRF_RADIO->EVENTS_DISABLED == 0);
+                NRF_RADIO->EVENTS_DISABLED = 0;
+            } else {
+                 // 超時沒收到，停止
+                NRF_RADIO->TASKS_DISABLE = 1;
+                while(NRF_RADIO->EVENTS_DISABLED == 0);
+                NRF_RADIO->EVENTS_DISABLED = 0;
+            }
+            
+            // 換下一個 PID (模擬)
+            tx_packet[sizeof(tx_packet)-1] ^= 1;
+            k_sleep(K_MSEC(10));
+        }
+        
+        if (!paired) {
+            ch_idx = (ch_idx + 1) % 3; // 換頻道
+        }
+    }
+
+    // --- 階段二：正式連線 (IMU 接收) ---
+    printk(">>> Entering Private Mode: %08X <<<\n", private_id);
+    
+    // 重新初始化為私有配置
+    NRF_RADIO->TASKS_DISABLE = 1;
+    while(NRF_RADIO->EVENTS_DISABLED == 0);
+    
+    NRF_RADIO->BASE1 = private_id;
+    NRF_RADIO->RXADDRESSES = 2; // Enable Base1 (Logical Address 1)
+    
+    // 這裡通常要設定頻率跳頻表 (Hopping)，目前先停在配對頻道測試
+    NRF_RADIO->SHORTS = RADIO_SHORTS_READY_START_Msk | RADIO_SHORTS_END_START_Msk; // 持續接收
     NRF_RADIO->PACKETPTR = (uint32_t)rx_buffer;
-
-    // 清事件
-    NRF_RADIO->EVENTS_END = 0;
-    NRF_RADIO->EVENTS_DISABLED = 0;
-    NRF_RADIO->EVENTS_RSSIEND = 0;
-
-    // 先 disable 確保狀態機乾淨
-    radio_disable_clean();
-
-    // 啟動 RX
     NRF_RADIO->TASKS_RXEN = 1;
 
-    // 先觸發一次 RSSI 取樣（不一定等 READY）
-    int8_t rssi_dbm = radio_sample_rssi_dbm();
-
-    // 等 END 或 timeout
-    for (uint32_t i = 0; i < timeout_us; i++) {
-        if (NRF_RADIO->EVENTS_END) {
-            // 確保 RSSI 有更新一次（若剛剛那次沒成功，再補一次）
-            if (rssi_dbm == -127) {
-                rssi_dbm = radio_sample_rssi_dbm();
-            }
-
-            uint8_t rxmatch = (uint8_t)(NRF_RADIO->RXMATCH & 0xFF);
-
-#if ENABLE_HW_CRC
-            uint8_t crcok = (NRF_RADIO->CRCSTATUS ? 1 : 0);
-#else
-            uint8_t crcok = 255; // unknown
-#endif
-
-            if (out_rssi_dbm) *out_rssi_dbm = rssi_dbm;
-            if (out_rxmatch)  *out_rxmatch  = rxmatch;
-            if (out_crcok)    *out_crcok    = crcok;
-
-#if ENABLE_HW_CRC
-            if (!NRF_RADIO->CRCSTATUS) {
-                return false; // 只要 CRC 失敗，直接視為無效（避免噪聲）
-            }
-#endif
-            return true;
-        }
-        k_busy_wait(1);
-    }
-
-    // timeout
-    radio_disable_clean();
-    return false;
-}
-
-/* 新版：多一欄 rep（連續相同包數） */
-static void print_packet_csv_rep(int64_t ts_ms, uint8_t freq_off, int8_t rssi_dbm,
-                                 uint8_t rxmatch, uint8_t crcok, uint32_t rep,
-                                 const uint8_t *buf)
-{
-    // CSV：PKT,ts_ms,freq_mhz,off,pipe,rssi_dbm,crcok,rep,hex64...
-    printk("PKT,%lld,%u,%u,%u,%d,%u,%u,",
-           ts_ms,
-           (uint32_t)(2400 + freq_off),
-           (uint32_t)freq_off,
-           (uint32_t)rxmatch,
-           (int)rssi_dbm,
-           (uint32_t)crcok,
-           (uint32_t)rep);
-
-    for (int i = 0; i < PRINT_BYTES; i++) {
-        printk("%02X", buf[i]);
-        if (i != PRINT_BYTES - 1) printk(" ");
-    }
-    printk("\n");
-}
-
-int main(void)
-{
-    if (device_is_ready(led.port)) {
-        gpio_pin_configure_dt(&led, GPIO_OUTPUT_ACTIVE);
-        gpio_pin_set_dt(&led, 0);
-    }
-
-    (void)usb_enable(NULL);
-
-    // 延遲啟動（方便你開 terminal/開始紀錄）
-    for (int i = 0; i < 8; i++) {
-        gpio_pin_toggle_dt(&led);
-        k_sleep(K_MSEC(500));
-    }
-    gpio_pin_set_dt(&led, 0);
-
-    printk("\n");
-    printk("============================================\n");
-    printk("PICO RF SNIFFER (pipe1, MAXLEN=%d)\n", PRINT_BYTES);
-#if ENABLE_HW_CRC
-    printk("CRC16: ON (poly=0x11021 init=0xFFFF)\n");
-#else
-    printk("CRC16: OFF\n");
-#endif
-#if FILTER_IMU_ONLY
-    printk("Filter: IMU only (0x1C 0x03 0x00)\n");
-#else
-    printk("Filter: ALL CRCOK frames (RSSI>%d dBm)\n", RSSI_THRESHOLD_DBM);
-#endif
-    printk("Output: CSV  PKT,ts_ms,freq_mhz,off,pipe,rssi_dbm,crcok,rep,hex64\n");
-    printk("Note: Only prints when packet content changes; rep counts consecutive identical packets.\n");
-    printk("============================================\n");
-
-    radio_init();
-
-    size_t freq_idx = 0;
-
     while (1) {
-        int64_t now_ms = k_uptime_get();
-
-        uint8_t current_freq;
-        if (lock_freq >= 0 && now_ms < lock_until_ms) {
-            current_freq = (uint8_t)lock_freq;
-        } else {
-            lock_freq = -1;
-            current_freq = target_freqs[freq_idx++];
-            if (freq_idx >= (sizeof(target_freqs) / sizeof(target_freqs[0]))) {
-                freq_idx = 0;
+        if (NRF_RADIO->EVENTS_END) {
+            NRF_RADIO->EVENTS_END = 0;
+            if (NRF_RADIO->CRCSTATUS) {
+                printk("IMU Data: %02X %02X %02X...\n", rx_buffer[0], rx_buffer[1], rx_buffer[2]);
             }
         }
-
-        int64_t dwell_end = k_uptime_get() + DWELL_MS;
-
-        while (k_uptime_get() < dwell_end) {
-            int8_t rssi_dbm = -127;
-            uint8_t rxmatch = 0xFF;
-            uint8_t crcok   = 0xFF;
-
-            bool ok = radio_rx_once(current_freq, RX_WAIT_US, &rssi_dbm, &rxmatch, &crcok);
-            if (!ok) {
-                continue;
-            }
-
-            // RSSI 門檻（-60 > -95 成立）
-            if (rssi_dbm <= RSSI_THRESHOLD_DBM) {
-                continue;
-            }
-
-#if FILTER_IMU_ONLY
-            if (!frame_is_imu28(rx_buffer)) {
-                continue;
-            }
-#endif
-
-            // 命中：LED toggle（你要用它當心跳也行）
-            gpio_pin_toggle_dt(&led);
-
-            /* --------- Dedup + run-length --------- */
-            bool same = false;
-            if (have_last && memcmp(rx_buffer, last_buf, PRINT_BYTES) == 0) {
-                same = true;
-            }
-
-            int64_t ts = k_uptime_get();
-
-            if (same) {
-                /* 同包：只累積，不印 */
-                last_rep++;
-                /* meta 更新成最新一次看到的值（讓你知道最後落在哪個頻點、最後RSSI） */
-                last_ts_ms = ts;
-                last_freq_off = current_freq;
-                last_rssi_dbm = rssi_dbm;
-                last_rxmatch  = rxmatch;
-                last_crcok    = crcok;
-            } else {
-                /* 不同包：先把上一段 run 印出來（rep=累積次數） */
-                if (have_last) {
-                    print_packet_csv_rep(last_ts_ms, last_freq_off, last_rssi_dbm,
-                                         last_rxmatch, last_crcok, last_rep,
-                                         last_buf);
-                }
-
-                /* 開新 run：把目前包存起來，rep=1（先不印，等下一次變化才印） */
-                memcpy(last_buf, rx_buffer, PRINT_BYTES);
-                have_last = true;
-                last_rep = 1;
-
-                last_ts_ms = ts;
-                last_freq_off = current_freq;
-                last_rssi_dbm = rssi_dbm;
-                last_rxmatch  = rxmatch;
-                last_crcok    = crcok;
-            }
-            /* ------------------------------------- */
-
-            // 命中後鎖住此頻點一段時間（有助於連續抓包/跟頻）
-            lock_freq = current_freq;
-            lock_until_ms = k_uptime_get() + LOCK_ON_MS;
-
-            // 命中後 dwell 也稍微延長，增加連續抓到的機率
-            dwell_end = k_uptime_get() + (DWELL_MS + 600);
-        }
+        k_yield();
     }
 }
