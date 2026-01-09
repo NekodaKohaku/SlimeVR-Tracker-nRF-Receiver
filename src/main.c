@@ -1,6 +1,7 @@
 #include <zephyr/kernel.h>
 #include <zephyr/sys/printk.h>
 #include <zephyr/usb/usb_device.h>
+#include <zephyr/drivers/uart.h>
 #include <zephyr/drivers/gpio.h>
 #include <hal/nrf_radio.h>
 #include <string.h>
@@ -9,38 +10,42 @@
 // 參數定義 (來自逆向工程)
 // ---------------------------------------------------------
 #define PUBLIC_ADDR      0x552C6A1E
-#define PAYLOAD_ID_SALT  0xB9522E32  // 你的 Payload ID (Little Endian in math)
+#define PAYLOAD_ID_SALT  0xB9522E32  // PICO 的簽名/鹽值
 
-// Dongle 發送的挑戰包 (模擬 V80)
-// 格式: Header(4) + Payload(Variable) + Salt(4)
+// 掃描頻道 (2401, 2426, 2480 MHz)
+static const uint8_t scan_channels[] = {1, 26, 80};
+
+// Dongle 發送的挑戰包 (模擬 V80 Python 腳本)
+// 格式: Header(4) + Payload(Variable) + Salt(4) + PID(1)
+// 這就是你要 "喊" 給追蹤器聽的內容
 static uint8_t tx_packet[] = {
-    // Header (11 02 04 00)
+    // Header (11 02 04 00) - 標準數據包頭
     0x11, 0x02, 0x04, 0x00, 
-    // Payload (任意填充，只要結尾是 Salt)
+    // Payload (任意填充數據)
     0x7C, 0x00, 0x00, 0x00, 0x55, 0x00, 0x00, 0x08, 0x80, 0xA4,
-    // Salt (B9 52 2E 32 -> Little Endian stored as 32 2E 52 B9)
+    // Salt (關鍵！必須是 B9 52 2E 32 -> Little Endian)
     0x32, 0x2E, 0x52, 0xB9, 
-    0x01 // PID / Seq
+    // PID (之後會動態切換 00/01)
+    0x00 
 };
 
-// 接收緩衝區
+// 接收緩衝區 (用來存放追蹤器回傳的 FICR)
 static uint8_t rx_buffer[32];
 
 // ---------------------------------------------------------
 // 輔助函數
 // ---------------------------------------------------------
 
-// ARM RBIT 指令 (反轉位元)
-static uint32_t rbit(uint32_t value) {
+// ARM RBIT 指令 (反轉位元) - C 語言標準庫沒有，必須用組合語言
+static inline uint32_t rbit(uint32_t value) {
     uint32_t result;
-    // 使用 ARM 內建指令加速
     __asm volatile ("rbit %0, %1" : "=r" (result) : "r" (value));
     return result;
 }
 
-// 初始化無線電 (模擬 Python V80 的設定)
+// 初始化無線電
 void radio_init(uint32_t frequency) {
-    // 1. 關閉無線電
+    // 1. 確保無線電處於關閉狀態
     NRF_RADIO->TASKS_DISABLE = 1;
     while (NRF_RADIO->EVENTS_DISABLED == 0);
     NRF_RADIO->EVENTS_DISABLED = 0;
@@ -53,52 +58,44 @@ void radio_init(uint32_t frequency) {
     // 3. 設定地址 (Base0 = Public)
     NRF_RADIO->PREFIX0 = 0;
     NRF_RADIO->BASE0   = PUBLIC_ADDR;
-    NRF_RADIO->TXADDRESS   = 0; // 使用 Base0 發送
-    NRF_RADIO->RXADDRESSES = 1; // 使用 Base0 接收
+    NRF_RADIO->TXADDRESS   = 0; // 發送使用 Logical Address 0
+    NRF_RADIO->RXADDRESSES = 1; // 接收啟用 Logical Address 0
 
-    // 4. 設定封包結構 (PCNF0/1) - 必須與 PICO 嚴格匹配
+    // 4. 設定封包結構 (必須與 PICO 嚴格匹配)
     // LFLEN=8bit, S0LEN=1bit, S1LEN=0
     NRF_RADIO->PCNF0 = (8 << RADIO_PCNF0_LFLEN_Pos) |
                        (1 << RADIO_PCNF0_S0LEN_Pos) |
                        (0 << RADIO_PCNF0_S1LEN_Pos);
 
-    // MaxLen=255, Balen=3 (Base address length 4 bytes total), Endian=Little
+    // MaxLen=255, Balen=3 (Base address length 4 bytes), Endian=Little, WhiteEn=1
     NRF_RADIO->PCNF1 = (255 << RADIO_PCNF1_MAXLEN_Pos) |
                        (3   << RADIO_PCNF1_BALEN_Pos) |
                        (RADIO_PCNF1_ENDIAN_Little << RADIO_PCNF1_ENDIAN_Pos) |
-                       (1   << RADIO_PCNF1_WHITEEN_Pos); // 如果有開 Whitening 就要加，通常 PICO 有開
+                       (1   << RADIO_PCNF1_WHITEEN_Pos); 
 
     // 5. CRC 設定 (3 bytes)
     NRF_RADIO->CRCCNF = (RADIO_CRCCNF_LEN_Three << RADIO_CRCCNF_LEN_Pos) |
                         (RADIO_CRCCNF_SKIPADDR_Skip << RADIO_CRCCNF_SKIPADDR_Pos);
-    NRF_RADIO->CRCINIT = 0xFFFF; // 通常初始值
-    NRF_RADIO->CRCPOLY = 0x11021; // CRC-CCITT (需要確認，通常 nRF 預設)
+    NRF_RADIO->CRCINIT = 0xFFFF;
+    NRF_RADIO->CRCPOLY = 0x11021; // CRC-CCITT
 }
 
-// 計算私有地址算法
+// 計算私有地址 (核心演算法)
+// Radio ID = RBIT(FICR + Salt)
 uint32_t calculate_pico_address(uint32_t ficr) {
-    // 1. FICR + Salt (Byte-wise addition)
-    // 為了方便，我們把它當作 byte array 處理
     uint8_t *f = (uint8_t*)&ficr;
-    uint8_t *s = (uint8_t*)&(uint32_t){PAYLOAD_ID_SALT}; // 0xB9522E32
+    uint32_t salt_val = PAYLOAD_ID_SALT;
+    uint8_t *s = (uint8_t*)&salt_val;
     uint8_t res[4];
 
-    // 注意：這裡是 Little Endian 記憶體佈局
-    // FICR: 19 7E A1 F3 (0xF3A17E19)
-    // Salt: 32 2E 52 B9 (0xB9522E32)
-    
+    // Byte-wise 加法 (模擬 8-bit overflow)
+    // FICR: 19 7E A1 F3 ...
+    // Salt: 32 2E 52 B9 ...
     for(int i=0; i<4; i++) {
         res[i] = (f[i] + s[i]) & 0xFF;
     }
 
-    // 組合回 32-bit (因為我們要 RBIT，這裡要小心 Endian)
-    // 根據 Python 邏輯：AC F3 AC 4B -> RBIT -> D2 35 CF 35
-    // 我們需要構建 0x4BACF3AC 讓 RBIT 翻轉成 0xD235CF35 ?
-    // 不，RBIT 是 bit 級別反轉。
-    
-    // 讓我們直接用整數加法模擬 Python 的 byte-wise 行為
-    // Python: AC F3 AC 4B (Big Endian representation of calculation result)
-    // 我們要構造這個整數
+    // 組合回 32-bit 整數
     uint32_t combined = (res[3] << 24) | (res[2] << 16) | (res[1] << 8) | res[0];
     
     // 執行 RBIT
@@ -110,138 +107,157 @@ uint32_t calculate_pico_address(uint32_t ficr) {
 // ---------------------------------------------------------
 void main(void)
 {
-    // 初始化 USB (看 Log 用)
+    // 1. 初始化 USB Stack
     if (usb_enable(NULL)) {
         return;
     }
-    k_sleep(K_SECONDS(1)); // 等 USB 連上
-    printk("=== PICO Dongle Clone Starting ===\n");
 
-    // 配對用的頻率列表 (掃描這三個)
-    uint8_t channels[] = {1, 26, 80}; // 2401, 2426, 2480 MHz
+    // 2. 等待 Serial Terminal 連線 (DTR)
+    // 這確保你打開 PuTTY 時能看到第一行字，不會漏掉 Log
+    const struct device *dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_console));
+    uint32_t dtr = 0;
+    
+    // 如果想要插電就跑，可以註解掉這個 while 迴圈
+    // 如果要除錯，建議保留
+    while (!dtr) {
+        uart_line_ctrl_get(dev, UART_LINE_CTRL_DTR, &dtr);
+        k_sleep(K_MSEC(100));
+    }
+
+    printk("\n\n");
+    printk("==========================================\n");
+    printk("   PICO Tracker Dongle Clone (Zephyr)     \n");
+    printk("   Protocol: Active Ping -> Wait for FICR \n");
+    printk("==========================================\n");
+    k_sleep(K_SECONDS(1));
+
     int ch_idx = 0;
-
     bool paired = false;
     uint32_t private_id = 0;
 
-    // --- 階段一：配對 (Ping-Pong Loop) ---
+    // === 階段一：配對掃描 (Ping-Pong) ===
     while (!paired) {
-        // 設定頻率
-        radio_init(channels[ch_idx]);
-        printk("Scanning on Channel %d...\n", channels[ch_idx]);
+        // 切換頻率
+        uint8_t current_freq = scan_channels[ch_idx];
+        radio_init(current_freq);
+        printk("Scanning on %d MHz...\n", 2400 + current_freq);
 
-        // 嘗試發送 10 次請求
-        for(int i=0; i<10; i++) {
-            // 1. 設定 TX Buffer
+        // 在每個頻道嘗試發送 20 次請求
+        for(int i=0; i<20; i++) {
+            
+            // --- A. 發送挑戰包 (TX) ---
             NRF_RADIO->PACKETPTR = (uint32_t)tx_packet;
             
-            // 2. 設定 SHORTS (TX -> RX 自動切換)
-            // READY->START (自動發)
-            // END->DISABLE (發完關)
-            // DISABLED->RXEN (關完開收 - 抓 ACK)
-            NRF_RADIO->SHORTS = RADIO_SHORTS_READY_START_Msk | 
-                                RADIO_SHORTS_END_DISABLE_Msk | 
-                                RADIO_SHORTS_DISABLED_RXEN_Msk;
-
-            // 清除事件
+            // 設定: 發送完自動關閉 (END -> DISABLE)
+            NRF_RADIO->SHORTS = RADIO_SHORTS_READY_START_Msk | RADIO_SHORTS_END_DISABLE_Msk;
+            
             NRF_RADIO->EVENTS_END = 0;
             NRF_RADIO->EVENTS_DISABLED = 0;
-
-            // 3. 啟動發送 (觸發整個 SHORTS 鏈)
-            NRF_RADIO->TASKS_TXEN = 1;
-
-            // 4. 等待發送完成，並進入 RX 狀態
-            // 我們這裡給它一點時間自動切換
-            while(NRF_RADIO->EVENTS_DISABLED == 0); // TX 完成
-            NRF_RADIO->EVENTS_DISABLED = 0;
             
-            // 此時硬體應該已經自動跳到 RXEN -> READY -> START (因為 SHORTS 沒設 RX 的停止)
-            // 我們手動設定 RX 的接收 Buffer (最好在 TX 前設好，但這裡為了簡單)
+            // 啟動 TX
+            NRF_RADIO->TASKS_TXEN = 1;
+            
+            // 等待發送完成
+            while(NRF_RADIO->EVENTS_DISABLED == 0);
+            NRF_RADIO->EVENTS_DISABLED = 0;
+
+            // --- B. 快速切換接收 (RX) ---
+            // 注意：這裡我們用軟體切換，雖然比 SHORTS 慢一點點，但方便改 PacketPtr
             NRF_RADIO->PACKETPTR = (uint32_t)rx_buffer;
             
-            // 啟動 RX (如果 SHORTS 沒自動幫我們 Start，手動補一腳)
-            if (NRF_RADIO->STATE != RADIO_STATE_STATE_Rx) {
-                NRF_RADIO->TASKS_START = 1; 
+            // 設定: 接收完自動停止
+            NRF_RADIO->SHORTS = RADIO_SHORTS_READY_START_Msk | RADIO_SHORTS_END_DISABLE_Msk;
+            NRF_RADIO->EVENTS_END = 0;
+            
+            // 啟動 RX
+            NRF_RADIO->TASKS_RXEN = 1;
+            
+            // --- C. 等待 ACK (FICR) ---
+            // PICO 回應很快 (通常 < 500us)，我們等待 5ms 即可
+            bool packet_received = false;
+            for(int w=0; w<5000; w++) { // Busy wait timeout
+                if(NRF_RADIO->EVENTS_END) {
+                    packet_received = true;
+                    break;
+                }
+                k_busy_wait(1); // 1us wait
             }
 
-            // 5. 聽 10ms 等 ACK
-            k_busy_wait(10000); 
-
-            if (NRF_RADIO->EVENTS_END) {
-                // 收到東西了！
-                if (NRF_RADIO->CRCSTATUS == 1) { // CRC 正確
-                    // 檢查封包特徵 (Header 0D 02 02 00)
-                    // rx_buffer[0] 是長度
+            if (packet_received) {
+                // 收到封包！檢查 CRC
+                if (NRF_RADIO->CRCSTATUS == 1) {
+                    // 檢查是否為配對回應包 (長度 0D, Header 0D 02 02 00)
+                    // rx_buffer[0] 是 Length (0x0D)
                     if (rx_buffer[0] == 0x0D) {
-                        printk("Captured Packet! Length: 13\n");
-                        
-                        // 提取 FICR (Offset 4, 5, 6, 7)
-                        // rx_buffer: [Len] [S0] [S1] [F0] [F1] [F2] [F3] ...
-                        //             0    1    2    3    4    5    6    
-                        // 注意 S0, S1 位元偏移，通常 RAM 裡 Byte 3 開始是 Payload
-                        // 假設: Len(0), S0(1), S1(2), Payload[0]...
-                        // 根據你的 Dump: 0D 02 02 00 19 ...
-                        // Len=0D, S0=02, S1=00(padded?)
-                        // 實際上 nRF EasyDMA 會把 Header 分開還是合再一起取決於設定
-                        // 簡單起見，我們掃描 buffer 找 FICR 特徵
-                        
-                        // 假設 FICR 在 buffer[4] ~ buffer[7]
+                        printk("\n[+] Captured Packet! Length: 13\n");
+                        printk("    Raw: ");
+                        for(int k=0; k<16; k++) printk("%02X ", rx_buffer[k]);
+                        printk("\n");
+
+                        // 提取 FICR
+                        // 根據 Log: 0D 02 02 00 [19 7E A1 F3] ...
+                        // Header(0,1,2,3) -> FICR(4,5,6,7)
                         uint32_t ficr = 0;
-                        memcpy(&ficr, &rx_buffer[4], 4); // 19 7E A1 F3 -> 0xF3A17E19
+                        memcpy(&ficr, &rx_buffer[4], 4); 
                         
-                        printk("Found FICR: %08X\n", ficr);
+                        printk("    Target FICR: %08X\n", ficr);
                         
-                        // 計算地址
+                        // 計算私有地址
                         private_id = calculate_pico_address(ficr);
-                        printk("Calculated Private ID: %08X\n", private_id);
+                        printk("    >>> Calculated Private ID: %08X <<<\n", private_id);
                         
                         paired = true;
-                        break;
+                        break; // 退出 for 迴圈
                     }
                 }
-                // 停止接收，準備下一次 Ping
-                NRF_RADIO->TASKS_DISABLE = 1;
-                while(NRF_RADIO->EVENTS_DISABLED == 0);
-                NRF_RADIO->EVENTS_DISABLED = 0;
-            } else {
-                 // 超時沒收到，停止
-                NRF_RADIO->TASKS_DISABLE = 1;
-                while(NRF_RADIO->EVENTS_DISABLED == 0);
-                NRF_RADIO->EVENTS_DISABLED = 0;
             }
             
-            // 換下一個 PID (模擬)
+            // 停止接收 (如果超時)
+            NRF_RADIO->TASKS_DISABLE = 1;
+            while(NRF_RADIO->EVENTS_DISABLED == 0);
+            NRF_RADIO->EVENTS_DISABLED = 0;
+
+            // 切換 PID (模擬真實通訊)
             tx_packet[sizeof(tx_packet)-1] ^= 1;
-            k_sleep(K_MSEC(10));
+            
+            k_sleep(K_MSEC(10)); // 發送間隔
         }
         
         if (!paired) {
-            ch_idx = (ch_idx + 1) % 3; // 換頻道
+            ch_idx = (ch_idx + 1) % 3; // 換下一個頻道
+            k_sleep(K_MSEC(50));
         }
     }
 
-    // --- 階段二：正式連線 (IMU 接收) ---
-    printk(">>> Entering Private Mode: %08X <<<\n", private_id);
+    // === 階段二：連線成功 (進入私有頻道) ===
+    printk("\n[Success] Pairing Complete! Listening on Private Channel...\n");
     
     // 重新初始化為私有配置
+    // 這裡通常需要更複雜的跳頻邏輯，目前我們先監聽 "算出後的 ID"
+    // 注意：實際運作中，追蹤器配對完會跳到數據頻道，可能不是 2401/26/80
+    // 但我們會先把 Base1 設好，證明地址正確
+    
     NRF_RADIO->TASKS_DISABLE = 1;
     while(NRF_RADIO->EVENTS_DISABLED == 0);
-    
+
+    // 設定私有地址到 BASE1 (Logic Address 1)
     NRF_RADIO->BASE1 = private_id;
-    NRF_RADIO->RXADDRESSES = 2; // Enable Base1 (Logical Address 1)
-    
-    // 這裡通常要設定頻率跳頻表 (Hopping)，目前先停在配對頻道測試
-    NRF_RADIO->SHORTS = RADIO_SHORTS_READY_START_Msk | RADIO_SHORTS_END_START_Msk; // 持續接收
+    NRF_RADIO->RXADDRESSES = 2; // 只啟用 Logic 1 (BASE1 + PREFIX0[1])
+
     NRF_RADIO->PACKETPTR = (uint32_t)rx_buffer;
+    NRF_RADIO->SHORTS = RADIO_SHORTS_READY_START_Msk | RADIO_SHORTS_END_START_Msk; // 持續接收
+    
     NRF_RADIO->TASKS_RXEN = 1;
 
     while (1) {
         if (NRF_RADIO->EVENTS_END) {
             NRF_RADIO->EVENTS_END = 0;
             if (NRF_RADIO->CRCSTATUS) {
-                printk("IMU Data: %02X %02X %02X...\n", rx_buffer[0], rx_buffer[1], rx_buffer[2]);
+                // 收到 IMU 數據！
+                printk("IMU Pkt: %02X %02X %02X %02X...\n", 
+                       rx_buffer[0], rx_buffer[1], rx_buffer[2], rx_buffer[3]);
             }
         }
-        k_yield();
+        k_sleep(K_MSEC(1));
     }
 }
