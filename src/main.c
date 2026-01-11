@@ -1,3 +1,10 @@
+/*
+ * PICO Dongle Clone - FAST SWITCH (SHORTS)
+ * 1. 保持 Big Endian, Prefix C0, CRC Fix (TX 已驗證成功)
+ * 2. 使用 SHORTS 自動切換 TX -> RX (解決漏接 ACK 問題)
+ * 3. 動態更新 Packet Pointer
+ */
+
 #include <zephyr/kernel.h>
 #include <zephyr/sys/printk.h>
 #include <zephyr/usb/usb_device.h>
