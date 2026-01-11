@@ -1,3 +1,11 @@
+/*
+ * PICO Dongle Clone - BIG ENDIAN FIX
+ * 修正說明：
+ * 1. PCNF1 Bit 24 Set to 1 (Big Endian) -> 解決 11 變成 88 的問題
+ * 2. Prefix = 0xC0 (配合 Dump)
+ * 3. CRC Include Address (配合 Dump)
+ */
+
 #include <zephyr/kernel.h>
 #include <zephyr/sys/printk.h>
 #include <zephyr/usb/usb_device.h>
@@ -13,25 +21,22 @@
 
 static const struct gpio_dt_spec led = GPIO_DT_SPEC_GET(LED0_NODE, gpios);
 
-// === TX 結構 (S0=0, S1=4) ===
+// === TX 結構 ===
+// 保持原樣，現在 Endian 改了，這些 Byte 會以正確的 Bit 順序飛出去
 static uint8_t tx_packet[] = {
-    // Byte 0: Length
-    0x11, 
-    // Byte 1: S1 (4 bits) -> Value 2
-    0x02, 
+    0x11, // Length
+    0x02, // S1 (Value 2)
     
     // Payload
     0x04, 0x00,             
     0x7C, 0x00, 0x00, 0x00, 
     0x55, 0x00, 0x00, 0x08, 
     0x80, 0xA4,             
-    0x32, 0x2E, 0x52, 0xB9, // SALT
-    0x00                    // Seq
+    0x32, 0x2E, 0x52, 0xB9, 
+    0x00                    
 };
 
 static uint8_t rx_buffer[64];
-
-// === 輔助函數 ===
 
 static inline void radio_disable_clean(void)
 {
@@ -65,31 +70,27 @@ static void radio_init(uint32_t freq)
     NRF_RADIO->FREQUENCY = freq; 
     NRF_RADIO->MODE      = (RADIO_MODE_MODE_Nrf_2Mbit << RADIO_MODE_MODE_Pos);
 
-    // === 關鍵修正：ADDRESS PREFIX ===
-    // Dump 0x40001524 (PREFIX0) = 0x23C343C0
-    // 對於 Pipe 0 (Logical Addr 0)，取最低 byte => 0xC0
-    // 之前設 0 是錯的！
+    // Address Prefix (C0)
     NRF_RADIO->PREFIX0 = 0xC0; 
-    
     NRF_RADIO->BASE0   = PUBLIC_ADDR;
     NRF_RADIO->TXADDRESS   = 0; 
     NRF_RADIO->RXADDRESSES = 1; 
 
-    // PCNF0: Match Dump (S0=0, S1=4)
+    // PCNF0: S0=0, S1=4 (Dump Verified)
     NRF_RADIO->PCNF0 = (8UL << RADIO_PCNF0_LFLEN_Pos) | 
                        (0UL << RADIO_PCNF0_S0LEN_Pos) | 
                        (4UL << RADIO_PCNF0_S1LEN_Pos);
 
-    // PCNF1: Match Dump (BALEN=4, No White)
+    // PCNF1: 關鍵修正 BIG ENDIAN (Bit 24=1)
+    // 配合 Dump 0x01040023
     NRF_RADIO->PCNF1 = (35UL << RADIO_PCNF1_MAXLEN_Pos) |
                        (0UL  << RADIO_PCNF1_STATLEN_Pos) |
                        (4UL  << RADIO_PCNF1_BALEN_Pos) |
-                       (RADIO_PCNF1_ENDIAN_Little << RADIO_PCNF1_ENDIAN_Pos) |
+                       (RADIO_PCNF1_ENDIAN_Big << RADIO_PCNF1_ENDIAN_Pos) | // <--- 這裡改了！
                        (0UL  << RADIO_PCNF1_WHITEEN_Pos); 
 
-    // CRC: Match Dump (SkipAddr=0, Include Addr)
+    // CRC: Include Address (Dump Verified)
     NRF_RADIO->CRCCNF = 2; 
-
     NRF_RADIO->CRCINIT = 0xFFFF;
     NRF_RADIO->CRCPOLY = 0x11021;
 }
@@ -104,8 +105,8 @@ int main(void)
 
     k_sleep(K_SECONDS(2));
 
-    printk("\n=== PICO SENDER (ADDRESS FIXED) ===\n");
-    printk("Target: PREFIX=C0, BASE=552C6A1E\n");
+    printk("\n=== PICO SENDER (BIG ENDIAN FIXED) ===\n");
+    printk("Config: Big Endian, Prefix C0, S1=4\n");
 
     radio_init(TARGET_FREQ); 
     
@@ -132,13 +133,13 @@ int main(void)
         // Wait for Response
         for(volatile int w=0; w<20000; w++) {
             if(NRF_RADIO->EVENTS_END) {
+                // 有訊號
                 if (NRF_RADIO->CRCSTATUS) {
                     if (rx_buffer[0] == 0x0D) {
                         gpio_pin_set_dt(&led, 1);
                         printk("\n[+] ACK RECEIVED! CRC OK!\n");
                         
                         // Buffer: [Len][S1][Payload...]
-                        // FICR at Offset 4
                         uint32_t ficr = 0;
                         memcpy(&ficr, &rx_buffer[4], 4);
                         private_id = calculate_pico_address(ficr);
