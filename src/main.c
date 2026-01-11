@@ -9,33 +9,16 @@
 #define PUBLIC_ADDR      0x552C6A1E
 #define PAYLOAD_ID_SALT  0xB9522E32
 #define LED0_NODE        DT_ALIAS(led0)
-
-// 根據 Dump: Frequency = 1 (2401 MHz)
-// 我們先鎖定這個頻率，確定能通再說
-#define TARGET_FREQ      1 
+#define TARGET_FREQ      1  // 鎖定 2401 MHz (Channel 1)
 
 static const struct gpio_dt_spec led = GPIO_DT_SPEC_GET(LED0_NODE, gpios);
 
-// === TX 封包結構 (Bit-Perfect) ===
-// 根據 PCNF0: LFLEN=8, S0=0, S1=4
-// 硬體發送順序: [Length(8b)] -> [S1(4b)] -> [Payload...]
-// 注意：S1 是 4 bits，但記憶體最小單位是 Byte。
-// nRF 硬體會取 Byte 的低 4 位還是高 4 位？通常是低位。
-// Sniffer 看到 Raw: 11 02 04 00 ...
-// Byte 0: 11 (Length)
-// Byte 1: 02 (包含 S1). 02 = 0000 0010. S1可能是 2.
-// Byte 2: 04 (Payload Start)
-
+// === TX 結構 (配合 S0=0, S1=4) ===
 static uint8_t tx_packet[] = {
-    // Byte 0: LENGTH (LFLEN=8)
-    0x11,  // 17 Bytes
+    0x11, // Length (0x11 = 17)
+    0x02, // S1 (Low 4 bits used) -> Value 2
     
-    // Byte 1: S1 (4 bits) + Padding?
-    // 因為 S0LEN=0, 硬體會接著抓 S1。
-    // 我們照抄 Sniffer 的 0x02
-    0x02,  
-    
-    // Byte 2~18: PAYLOAD (17 Bytes)
+    // Payload (17 Bytes)
     0x04, 0x00,             
     0x7C, 0x00, 0x00, 0x00, 
     0x55, 0x00, 0x00, 0x08, 
@@ -80,30 +63,29 @@ static void radio_init(uint32_t freq)
     NRF_RADIO->FREQUENCY = freq; 
     NRF_RADIO->MODE      = (RADIO_MODE_MODE_Nrf_2Mbit << RADIO_MODE_MODE_Pos);
 
-    // 地址設定 (與 Dump 0x40001518 一致: BALEN=4)
     NRF_RADIO->PREFIX0 = 0;
     NRF_RADIO->BASE0   = PUBLIC_ADDR;
     NRF_RADIO->TXADDRESS   = 0; 
     NRF_RADIO->RXADDRESSES = 1; 
 
-    // PCNF0 (與 Dump 0x40001514 一致)
-    // LFLEN=8, S0LEN=0, S1LEN=4
-    // 這是之前失敗的主因！！
+    // PCNF0: Match Dump (LFLEN=8, S0=0, S1=4)
     NRF_RADIO->PCNF0 = (8UL << RADIO_PCNF0_LFLEN_Pos) | 
                        (0UL << RADIO_PCNF0_S0LEN_Pos) | 
                        (4UL << RADIO_PCNF0_S1LEN_Pos);
 
-    // PCNF1 (與 Dump 0x40001518 一致)
-    // MAXLEN=35(0x23), BALEN=4, WHITEEN=0
+    // PCNF1: Match Dump (No White, BALEN=4)
     NRF_RADIO->PCNF1 = (35UL << RADIO_PCNF1_MAXLEN_Pos) |
                        (0UL  << RADIO_PCNF1_STATLEN_Pos) |
                        (4UL  << RADIO_PCNF1_BALEN_Pos) |
                        (RADIO_PCNF1_ENDIAN_Little << RADIO_PCNF1_ENDIAN_Pos) |
                        (0UL  << RADIO_PCNF1_WHITEEN_Pos); 
 
-    // CRC (與 Dump 0x40001534 一致: LEN=2)
-    NRF_RADIO->CRCCNF = (RADIO_CRCCNF_LEN_Two << RADIO_CRCCNF_LEN_Pos) |
-                        (RADIO_CRCCNF_SKIPADDR_Skip << RADIO_CRCCNF_SKIPADDR_Pos);
+    // === 關鍵修正 CRC ===
+    // Dump 0x40001534 = 0x00000002
+    // 這代表 SKIPADDR = 0 (Include Address)
+    // 之前我們設成 Skip (Bit 8=1)，所以 CRC 永遠算錯
+    NRF_RADIO->CRCCNF = 2; // 直接設 2，確保 Bits 8-9 為 0
+
     NRF_RADIO->CRCINIT = 0xFFFF;
     NRF_RADIO->CRCPOLY = 0x11021;
 }
@@ -118,14 +100,10 @@ int main(void)
 
     k_sleep(K_SECONDS(2));
 
-    printk("\n=== PICO SENDER (DUMP VERIFIED) ===\n");
-    printk("Config: S0=0, S1=4 (Matched with Tracker Register)\n");
-    printk("Target: 2401 MHz\n");
+    printk("\n=== PICO SENDER (CRC FIXED) ===\n");
+    printk("CRCCNF=2 (Include Address), S1=4\n");
 
-    radio_init(TARGET_FREQ);
-    
-    // 雖然只鎖定 Channel 1，但如果連不上，手動在這裡改
-    // Dump 顯示目前是 1，但它可能會跳到 37(0x25) 或 77(0x4D)
+    radio_init(TARGET_FREQ); // Lock 2401 MHz
     
     bool paired = false;
     uint32_t private_id = 0;
@@ -147,28 +125,18 @@ int main(void)
         NRF_RADIO->EVENTS_END = 0;
         NRF_RADIO->TASKS_RXEN = 1;
         
-        // Wait for Response (10ms)
+        // Wait for Response
         for(volatile int w=0; w<20000; w++) {
             if(NRF_RADIO->EVENTS_END) {
-                // 有訊號
                 if (NRF_RADIO->CRCSTATUS) {
-                    // CRC OK
                     if (rx_buffer[0] == 0x0D) {
                         gpio_pin_set_dt(&led, 1);
-                        printk("\n[+] BINGO! ACK RECEIVED!\n");
-                        printk("    Data: ");
-                        for(int k=0; k<14; k++) printk("%02X ", rx_buffer[k]);
-                        printk("\n");
+                        printk("\n[+] ACK RECEIVED! CRC OK!\n");
                         
-                        // Buffer Structure with S0=0, S1=4
-                        // rx_buffer[0] = Length (13)
-                        // rx_buffer[1] = S1 (02?)
-                        // rx_buffer[2]... = Payload
-                        
+                        // Buffer: [Len][S1][Payload...]
+                        // FICR is likely at offset 4
                         uint32_t ficr = 0;
-                        // 嘗試從 offset 4 抓取
                         memcpy(&ficr, &rx_buffer[4], 4);
-                        
                         private_id = calculate_pico_address(ficr);
                         printk("    FICR: %08X -> ID: %08X\n", ficr, private_id);
                         
@@ -185,13 +153,11 @@ int main(void)
 
         if (paired) break;
 
-        // Toggle Seq
         tx_packet[18] ^= 1; 
         k_sleep(K_MSEC(5));
     }
     
-    // === 配對成功，燈號閃爍 ===
-    printk("\n[DONE] ID Calculated: %08X\n", private_id);
+    printk("\n[DONE] ID: %08X\n", private_id);
     while(1) {
         gpio_pin_toggle_dt(&led);
         k_sleep(K_MSEC(500));
